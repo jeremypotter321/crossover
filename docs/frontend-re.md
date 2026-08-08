@@ -128,3 +128,71 @@ To add a menu entry, the next steps are:
 
 This cannot be validated without building the DLL, which requires the Windows CI job — the
 hooks are address-based and need write/build/inject/observe iteration to get right.
+
+---
+
+# Live findings (verified by injected probe)
+
+Everything below was confirmed against the running game via `tools/re-probe`, not
+inferred from static analysis.
+
+## Object model
+
+| Fact | Value |
+| --- | --- |
+| Button definition name | `*(char **)*(DWORD *)(button + 0x20)` |
+| Button render position (vertical) | `float` at `button + 0x038`, 30.0 per menu row |
+| `CFrontEndList` child vector | `{begin,end,capacity}` at list `+0x164 / +0x168 / +0x16C` |
+| Main menu | the `CFrontEndList` whose children include `UI_FRONTEND_BUTTON_QUIT` |
+| Button object size | > `0x1B0` (ctor at `0x0054DED0` touches `+0x1B0`) |
+| Button vtables | `+0x00`, `+0x04`, `+0x18` — multiple inheritance |
+
+Live main-menu children, in order: `UI_FRONTEND_BUTTON_LOAD_GAME`,
+`_CHANGE_PROFILE`, `_OPTIONS`, `_CREDITS`, `_ABOUT`, `_QUIT`.
+
+## What works
+
+Writing `button + 0x038` on a **live** button visibly moves it: setting the Options
+button from 60.0 to 160.0 moved that row to the bottom of the menu on screen. So the
+renderer reads button state per frame, and buttons are individually addressable.
+
+## What does NOT work — the `+0x164` vector is not the draw source
+
+This was tested to destruction, and all of it is negative:
+
+1. **Append a cloned button** (vector moved to our own storage, 7th entry, Y offset by one
+   row) — menu still rendered 6 entries.
+2. **Append early and repeatedly** — 226 appends starting at t≈12s, before and across the
+   menu being built. Still 6 entries.
+3. **Swap the last two entries** — rendered order unchanged. (Inconclusive on its own:
+   buttons carry absolute positions, so list order need not affect layout.)
+4. **Shrink the vector** so Quit is excluded — **Quit still rendered**. This is decisive:
+   the vector does not determine what is drawn.
+5. **Overwrite every pointer to the Quit button** with the Credits pointer — including
+   interior pointers at `+0x04`/`+0x18` for the multiple-inheritance bases, and rescanned
+   with `MEM_IMAGE`/`MEM_MAPPED` included so the exe's own `.data` was covered. Quit still
+   rendered.
+6. **Guard page** on the button's page with a vectored exception handler to catch the
+   reading instruction — zero faults; Wine does not deliver `STATUS_GUARD_PAGE_VIOLATION`
+   here, so this technique is unavailable under Wine.
+
+A full scan for *any* pointer landing inside the Quit button found only 9, at offsets
+`+0x000` (x4), `+0x004` (x2), `+0x1C8`, `+0x378`, `+0x3C0`.
+
+**Conclusion:** the set of drawn entries is not resolved by following button pointers at
+draw time. It is fixed when the screen is constructed, while per-entry properties (like
+position) are still read live. Mutating containers after the fact therefore cannot add a
+menu entry.
+
+## The remaining route
+
+Adding an entry has to happen at screen-construction time, through the game's own
+machinery, rather than by patching containers afterwards:
+
+1. From `sub_59899A` / `sub_595A06`, follow the path that turns a screen definition into
+   live `CFrontEndButton` objects.
+2. Find the routine that creates one button from a definition and attaches it to a screen.
+3. Detour that construction path and invoke the same routine once more for an extra entry.
+
+This needs a real detour (MinHook or hand-rolled trampoline) rather than the data pokes
+used so far, since it has to run during construction rather than after it.
