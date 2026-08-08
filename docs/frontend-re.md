@@ -61,9 +61,26 @@ String literals referenced from code:
 > `data/Defs/RetailHeaders/pc/front_end_bank.h`), not layout. Editing defs would mean
 > reverse engineering an undocumented binary schema; hooking code is the cheaper route.
 
+## `CFrontEndManager`'s code block
+
+Its constructor/destructor writes the vtable at `0x005953F1` and `0x005954B6`, both inside
+one function starting at **`0x00595356`**. MSVC emits a class's methods contiguously, so the
+run from roughly `0x595356` to `0x59C000` is `CFrontEndManager`. That places both menu
+functions below inside the class — neither is virtual, so `this` (`ecx`) is a
+`CFrontEndManager*` in both.
+
+Its 9 virtual methods:
+
+```
+[0] 0x0059B641   [1] 0x0059B5C2   [2] 0x0052D900
+[3] 0x0052DA20   [4] 0x0052D940   [5] 0x0052D9A0
+[6] 0x0052D7B0   [7] 0x0041C580   [8] 0x0059A238
+```
+
 ## The main-menu entry point
 
-`sub_59899A` — one argument, `this` in `ecx`. This is the function that opens the main menu.
+`sub_59899A` — `CFrontEndManager` method, one argument, `this` in `ecx`. This is the
+function that opens the main menu.
 
 ```
 0x0059899A  push  ebp                      ; this = ecx -> esi
@@ -100,8 +117,8 @@ ever uses the `NO_LIVEAWARE` pair (no Xbox Live).
 
 To add a menu entry, the next steps are:
 
-1. Identify the concrete type of `this` in `sub_59899A` (expected `CFrontEndManager` or
-   `CNewFrontendGameComponent`) by cross-referencing its vtable against the table above.
+1. ~~Identify the concrete type of `this` in `sub_59899A`.~~ Done — it is
+   `CFrontEndManager`, established from the constructor's location at `0x00595356`.
 2. Find where a `CFrontEndScreen` populates its children, and the method that appends a
    `CFrontEndButton`. Start from the button constructor sites in `0x54DE00`–`0x54E500` and
    walk callers.
