@@ -274,3 +274,73 @@ The open question for arbitrary elements is the definition object the factory co
 know `def+0x3C` selects the type, but the rest of that structure is not yet mapped. The
 next concrete step is dumping a live `CUIDef` (vtable `0x01259F8C`) for a known simple
 component — a `CText` — and diffing it against a second one to map the layout fields.
+
+---
+
+## 8. `CUIDef` — the definition object (captured live)
+
+Definitions are **`CUIDef` instances**, vtable `0x01259F8C`, confirmed by catching real ones
+out of the factory. The type catalogue in section 3 is validated against live data: a
+single frontend build produced definitions of types 0 (`CSprite`), 1 (`CMorphingSprite`),
+5 (`CChangingStateComponent`), 6 (`CText`), 10 (`CFrontEndScreen`), 16 (`CTextSlider`),
+22 (`CComponentContainer`) and 38 (`CNavButton`), each matching its decoded class.
+
+### Layout so far
+
+| offset | meaning |
+| --- | --- |
+| `+0x00` | vtable — `0x01259F8C` for `CUIDef` |
+| `+0x04` | `1` on every definition seen — reference count |
+| `+0x08` | **owning manager** — identical pointer across all definitions |
+| `+0x0C`, `+0x10` | per-definition pointers (parent / sibling links) |
+| `+0x14` | per-definition integer id (e.g. 994, 1747) |
+| `+0x18` | small integer, varies |
+| `+0x1C` | same pointer as `+0x08` |
+| `+0x20` | second per-definition integer id (e.g. 621, 604) |
+| **`+0x3C`** | **component type** — the factory's jump-table index |
+| `+0x40` | pointer to a string object |
+| `+0x44`, `+0x48` | equal to each other — an empty `std::vector` (`begin == end`) |
+| `+0x60` | `1` on every definition seen |
+| `+0x98`, `+0x9C` | font name on screen definitions — e.g. `"L_16"`; zero on `CText` |
+
+`"L_16"` is a **font reference**, which is very likely where the oversized menu entry's size
+comes from: fonts are banked (`data/lang/<lang>/fonts.big`, ids in
+`data/Defs/RetailHeaders/fonts.h`), so an entry's text size is chosen by definition at
+construction rather than scaled at draw time. That matches the earlier failure to find any
+live scale field on the component.
+
+### Reaching the definition manager
+
+- `0x0044C6B0` is `mov eax,[0x013B879C]; ret` — a plain global read. **That global reads
+  NULL from an injected thread**, so do not rely on it.
+- `0x009AD390` is `GetDefinition(nameKey, index)`: it calls the name lookup at `0x009AD2E0`
+  and then indexes `[result+8]` by `index`. It is *not* a name-only lookup.
+- The reliable handle is **`*(DWORD *)(anyCUIDef + 0x08)`** — every definition points at the
+  same manager instance. Grab one definition, and the manager comes with it.
+
+### Technique: capturing definitions with INT3
+
+Guard pages do not work under Wine (tried; the handler never fires). **`INT3` plus
+`AddVectoredExceptionHandler` does.** Patch one byte at `0x0041D249` — the factory's
+`mov eax,[ebx+0x3C]`, where `EBX` already holds the definition — and read `ContextRecord->Ebx`
+in the handler, then restore the byte and set `Eip` back to re-run the real instruction.
+
+Two things this needs to be right:
+
+- **Never save `0xCC` as the original byte.** Re-arming while already armed will do exactly
+  that, and the restore then writes `0xCC` back permanently.
+- **Re-arm tightly.** A screen's children are constructed in a burst; each hit disarms the
+  breakpoint, so re-arming on a 400 ms cadence caught 2 definitions where a `Sleep(1)` loop
+  caught 24.
+
+Keep the patch page `PAGE_EXECUTE_READWRITE` — dropping EXECUTE kills the game on the next
+instruction fetch.
+
+### What remains for authoring arbitrary UI
+
+The definition is now readable and the manager reachable. The open items are the fields
+between `+0x40` and `+0x98` that carry per-component layout (position, size, sprite id, text
+id), which need diffing across two definitions of the *same* type — the capture run
+collected only one `CFrontEndButton` definition, so that diff has not run yet. With those
+mapped, a definition can be cloned, edited and handed to the factory at `0x0041D21B` to
+produce a genuinely new, natively-styled component.

@@ -1,26 +1,18 @@
 /*
- * re-probe: adds a "Crossover" entry to Fable's main menu, from macOS.
+ * re-probe: maps the UI definition structure that Fable's component factory
+ * consumes.
  *
- * Cross-compiled with mingw-w64 and injected under Wine, giving a local
- * build/inject/observe loop. (The full mod still needs MSVC because SLikeNet is
- * a prebuilt MSVC C++ static lib; this probe links nothing.)
+ * Established previously (docs/ui-system.md): the factory at 0x0041D21B reads
+ * the component type from def+0x3C and dispatches through a jump table of 44
+ * types. Mapping the rest of that definition is what stands between reusing
+ * existing definitions and authoring arbitrary new UI.
  *
- * How it works -- and why it works this way:
+ * Strategy: a live component must reference the definition it was built from,
+ * so search each component's fields for a pointer to an object whose +0x3C
+ * holds that component's own type id. That finds both the def-pointer offset
+ * and a real definition, without guessing either.
  *
- *   Patching containers after the fact CANNOT add a menu entry. The
- *   CFrontEndList child vector at +0x164 is an ownership list, not the draw
- *   source: shrinking it still left the dropped entry rendering. The drawn set
- *   is fixed when the screen is constructed.
- *
- *   So instead this changes WHICH DEFINITION the menu is built from, before
- *   construction. sub_59899A selects the menu definition with a plain
- *   `push imm32`; rewriting that operand to a string of our own makes the game
- *   build a different menu through its own machinery. UI_FRONTEND_MAIN_MENU
- *   (the Xbox Live variant, unused on PC) carries one extra entry.
- *
- *   The label is then rewritten from "Xbox Live" to "Crossover" -- same length,
- *   so it is an in-place overwrite. It must run continuously from t=0 because
- *   the text is baked to glyphs at construction.
+ * Read-only: this probe only reads memory and writes a log.
  */
 
 #include <windows.h>
@@ -29,18 +21,24 @@
 
 #define LOG_PATH "probe.log"
 
-#define VT_FRONTEND_LIST 0x01249224u
+/* Component vtables (RTTI-derived, verified live). */
+#define VT_FRONTEND_LIST   0x01249224u
+#define VT_TEXT            0x01249CCCu
 
 #define VEC_BEGIN 0x164
 #define VEC_END   0x168
 #define VEC_CAP   0x16C
 
-/* Operands of the two `push imm32` menu-definition selections in sub_59899A. */
-#define PUSH_IMM_NO_CONTINUE 0x005989E2u
-#define PUSH_IMM_MAIN        0x005989E9u
+#define TYPE_OFF 0x3C                 /* component type inside a definition */
+#define TYPE_FRONTEND_BUTTON 0x0B
+#define TYPE_TEXT            0x06
 
-#define SCAN_BYTES 0x400
-#define MAX_OBJ 64
+/* .rdata, where vtables live -- used to sanity-check a candidate definition. */
+#define RDATA_LO 0x0122D000u
+#define RDATA_HI 0x01374000u
+
+#define DEF_DUMP 0xA0
+#define MAX_OBJ  64
 
 static FILE *g_log;
 static void *g_own_stack;
@@ -63,10 +61,9 @@ static int region_ok(const MEMORY_BASIC_INFORMATION *mbi)
     if (g_own_stack && (unsigned char *)g_own_stack >= base &&
         (unsigned char *)g_own_stack < next)
         return 0;
-    return mbi->State == MEM_COMMIT &&
+    return mbi->State == MEM_COMMIT && mbi->Type == MEM_PRIVATE &&
            !(mbi->Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-           (mbi->Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE |
-                            PAGE_READONLY | PAGE_EXECUTE_READ));
+           (mbi->Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
 }
 
 static int scan_dword(DWORD value, DWORD *out, int max_out)
@@ -90,229 +87,339 @@ static int scan_dword(DWORD value, DWORD *out, int max_out)
     return found;
 }
 
-static const char *button_defname(DWORD btn)
+static const char *comp_defname(DWORD c)
 {
     DWORD holder, str;
-    if (IsBadReadPtr((void *)(uintptr_t)(btn + 0x20), 4)) return NULL;
-    holder = *(DWORD *)(uintptr_t)(btn + 0x20);
+    if (IsBadReadPtr((void *)(uintptr_t)(c + 0x20), 4)) return NULL;
+    holder = *(DWORD *)(uintptr_t)(c + 0x20);
     if (holder < 0x10000 || IsBadReadPtr((void *)(uintptr_t)holder, 4)) return NULL;
     str = *(DWORD *)(uintptr_t)holder;
     if (str < 0x10000 || IsBadReadPtr((void *)(uintptr_t)str, 8)) return NULL;
     return (const char *)(uintptr_t)str;
 }
 
-static int patch_dword(DWORD at, DWORD value)
+/* The member of `comp` pointing at a definition whose +0x3C == want. */
+static DWORD find_def(DWORD comp, DWORD want, int *out_off)
 {
-    DWORD old;
-    if (!VirtualProtect((void *)(uintptr_t)at, 4, PAGE_EXECUTE_READWRITE, &old))
-        return 0;
-    *(DWORD *)(uintptr_t)at = value;
-    VirtualProtect((void *)(uintptr_t)at, 4, old, &old);
-    return 1;
+    int off;
+    for (off = 0; off < 0x200; off += 4) {
+        DWORD p, vt;
+        if (IsBadReadPtr((void *)(uintptr_t)(comp + (DWORD)off), 4)) continue;
+        p = *(DWORD *)(uintptr_t)(comp + (DWORD)off);
+        if (p < 0x10000) continue;
+        if (IsBadReadPtr((void *)(uintptr_t)(p + TYPE_OFF), 4)) continue;
+        if (*(DWORD *)(uintptr_t)(p + TYPE_OFF) != want) continue;
+        vt = *(DWORD *)(uintptr_t)p;               /* defs start with a vtable */
+        if (vt < RDATA_LO || vt >= RDATA_HI) continue;
+        if (out_off) *out_off = off;
+        return p;
+    }
+    return 0;
 }
 
-/* Rewrite every live copy of the label. Patterns are assembled at runtime so
- * the scan cannot match (and corrupt) this module's own string literals. */
-static void relabel_pass(const char *want, const char *repl, int len,
-                         int *n_ascii, int *n_utf16)
+static int try_str(DWORD va, char *out, int cap)
 {
-    MEMORY_BASIC_INFORMATION mbi;
-    unsigned char *addr = NULL;
-    unsigned short want_w[32], repl_w[32];
+    const unsigned char *p = (const unsigned char *)(uintptr_t)va;
     int i;
-
-    for (i = 0; i < len; i++) {
-        want_w[i] = (unsigned short)(unsigned char)want[i];
-        repl_w[i] = (unsigned short)(unsigned char)repl[i];
+    if (va < 0x10000 || IsBadReadPtr(p, 4)) return 0;
+    for (i = 0; i < cap - 1; i++) {
+        if (IsBadReadPtr(p + i, 1)) return 0;
+        if (p[i] == 0) break;
+        if (p[i] < 0x20 || p[i] > 0x7E) return 0;
+        out[i] = (char)p[i];
     }
+    out[i] = 0;
+    return i >= 3;
+}
 
-    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
-        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
-        /* Never write into executable pages: making them PAGE_READWRITE strips
-         * EXECUTE, and the game dies the moment it runs code there. Menu text
-         * lives in data, so skipping code costs nothing. */
-        /* Cover heap, mapped files and the exe's own data -- the copy the menu
-         * actually reads is NOT on the heap (a heap-only sweep found 4 of the
-         * 9 live copies and the label did not change). Executable regions are
-         * excluded: making one PAGE_READWRITE strips EXECUTE and the game dies
-         * on the next instruction fetch there. Menu text is never in code. */
-        int candidate = mbi.State == MEM_COMMIT &&
-                        !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                        !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                                         PAGE_EXECUTE_READWRITE |
-                                         PAGE_EXECUTE_WRITECOPY)) &&
-                        (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
-                                        PAGE_WRITECOPY)) != 0;
-        if (candidate && !(g_own_stack &&
-              (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
-              (unsigned char *)g_own_stack < next)) {
-            unsigned char *q = (unsigned char *)mbi.BaseAddress;
-            unsigned char *e2 = next - (len * 2);
-            unsigned char first = (unsigned char)want[0];
-            for (; q <= e2; q++) {
-                DWORD prot, back;
-                /* Cheap reject: the overwhelming majority of bytes cannot start
-                 * either encoding, and skipping the memcmp keeps each sweep
-                 * light enough not to disturb the game. */
-                if (*q != first) continue;
-                if (memcmp(q, want, len) == 0) {
-                    if (VirtualProtect(q, len, PAGE_READWRITE, &prot)) {
-                        memcpy(q, repl, len);
-                        VirtualProtect(q, len, prot, &back);  /* restore */
-                        (*n_ascii)++;
-                    }
-                } else if (memcmp(q, want_w, len * 2) == 0) {
-                    if (VirtualProtect(q, len * 2, PAGE_READWRITE, &prot)) {
-                        memcpy(q, repl_w, len * 2);
-                        VirtualProtect(q, len * 2, prot, &back);
-                        (*n_utf16)++;
-                    }
-                }
-            }
+static void dump_def(const char *label, DWORD def, int size)
+{
+    int off;
+    plog("");
+    plog("  --- %s : definition @ 0x%08lX (vtable 0x%08lX) ---",
+         label, def, *(DWORD *)(uintptr_t)def);
+    for (off = 0; off < size; off += 4) {
+        DWORD v;
+        float f;
+        char buf[80];
+        if (IsBadReadPtr((void *)(uintptr_t)(def + (DWORD)off), 4)) continue;
+        v = *(DWORD *)(uintptr_t)(def + (DWORD)off);
+        f = *(float *)&v;
+        if (off == TYPE_OFF) {
+            plog("    +0x%03X  0x%08lX   <== COMPONENT TYPE (%lu)", off, v, v);
+        } else if (try_str(v, buf, sizeof buf)) {
+            plog("    +0x%03X  0x%08lX   str  \"%s\"", off, v, buf);
+        } else if (v && !IsBadReadPtr((void *)(uintptr_t)v, 4) &&
+                   try_str(*(DWORD *)(uintptr_t)v, buf, sizeof buf)) {
+            plog("    +0x%03X  0x%08lX   ->   \"%s\"", off, v, buf);
+        } else if (f > -10000.0f && f < 10000.0f && f != 0.0f &&
+                   (v & 0x7F800000) != 0 && (v & 0x7F800000) != 0x7F800000) {
+            plog("    +0x%03X  0x%08lX   float %.3f", off, v, (double)f);
+        } else if (v < 0x10000) {
+            plog("    +0x%03X  0x%08lX   int  %lu", off, v, v);
+        } else {
+            plog("    +0x%03X  0x%08lX   ptr", off, v);
         }
-        if (next <= addr) break;
-        addr = next;
     }
+}
+
+
+/*
+ * Calling the game's own functions.
+ *
+ * The factory path revealed a definition-lookup API:
+ *     mgr = CGameDefinitionManager::Get()      0x0044C6B0, no args, result in eax
+ *     def = mgr->GetDefinition(&CharString, 1) 0x009AD390, thiscall
+ * with CharString built by its ctor/dtor pair:
+ *     CharString::CharString(const char *s, int len)  0x0099EBF0  thiscall
+ *     CharString::~CharString()                       0x0099EAE0  thiscall
+ *
+ * These are thiscall (this in ecx, callee cleans the stack), so they are
+ * invoked through inline asm rather than a C prototype.
+ */
+#define FN_DEFMGR_GET   0x0044C6B0u
+#define FN_GET_DEF      0x009AD390u
+#define FN_CHARSTR_CTOR 0x0099EBF0u
+#define FN_CHARSTR_DTOR 0x0099EAE0u
+
+static DWORD call0(DWORD fn)
+{
+    DWORD ret;
+    __asm__ __volatile__("call *%[f]" : "=a"(ret) : [f]"r"(fn)
+                         : "ecx", "edx", "memory", "cc");
+    return ret;
+}
+
+static DWORD call_this0(DWORD fn, DWORD thisp)
+{
+    DWORD ret;
+    __asm__ __volatile__("movl %[t], %%ecx\n\tcall *%[f]"
+                         : "=a"(ret) : [f]"r"(fn), [t]"r"(thisp)
+                         : "ecx", "edx", "memory", "cc");
+    return ret;
+}
+
+/* Stack ends up [esp]=a1, [esp+4]=a2, matching the game's own push order. */
+static DWORD call_this2(DWORD fn, DWORD thisp, DWORD a1, DWORD a2)
+{
+    DWORD ret;
+    __asm__ __volatile__(
+        "pushl %[b]\n\t"
+        "pushl %[a]\n\t"
+        "movl %[t], %%ecx\n\t"
+        "call *%[f]"
+        : "=a"(ret)
+        : [f]"r"(fn), [t]"r"(thisp), [a]"r"(a1), [b]"r"(a2)
+        : "ecx", "edx", "memory", "cc");
+    return ret;
+}
+
+/*
+ * The definition manager.
+ *
+ * 0x0044C6B0 is simply `mov eax,[0x013B879C]; ret` -- a global pointer. The
+ * factory uses the container's own manager at [obj+0x64] when set, and only
+ * falls back to this global, so both are tried here.
+ *
+ * 0x009AD390 is GetDefinition(nameKey, index): it calls the name lookup at
+ * 0x009AD2E0 and then indexes [result+8] by `index`.
+ */
+#define G_DEFMGR    0x013B879Cu
+#define FN_NAME_LOOKUP 0x009AD2E0u
+
+static DWORD g_defmgr;
+
+static DWORD get_def_by_name(const char *name)
+{
+    unsigned char str[128];
+    DWORD def;
+    if (!g_defmgr) return 0;
+    memset(str, 0, sizeof str);
+    call_this2(FN_CHARSTR_CTOR, (DWORD)(uintptr_t)str,
+               (DWORD)(uintptr_t)name, (DWORD)-1);
+    def = call_this2(FN_GET_DEF, g_defmgr, (DWORD)(uintptr_t)str, 1);
+    call_this0(FN_CHARSTR_DTOR, (DWORD)(uintptr_t)str);
+    return def;
+}
+
+
+/*
+ * Capturing a real definition pointer.
+ *
+ * The definition-manager global is NULL from our thread, so instead we catch
+ * the factory in the act. At 0x0041D249 the factory does `mov eax,[ebx+0x3C]`
+ * with EBX already holding the definition, so a one-shot INT3 there plus a
+ * vectored handler hands us a genuine def pointer with its type.
+ *
+ * INT3 is an ordinary breakpoint exception; Wine delivers it (unlike the guard
+ * pages tried earlier, which never fired).
+ */
+#define FACTORY_TYPE_READ 0x0041D249u
+
+#define MAX_CAUGHT 24
+static unsigned char g_orig_byte;
+static volatile DWORD g_caught[MAX_CAUGHT];
+static volatile LONG  g_caught_n;
+
+static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        (DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress == FACTORY_TYPE_READ) {
+        DWORD prot;
+        DWORD d = ep->ContextRecord->Ebx;
+        LONG i;
+        int seen = 0;
+        /* EBX holds the definition the factory is about to read the type from. */
+        for (i = 0; i < g_caught_n; i++)
+            if (g_caught[i] == d) { seen = 1; break; }
+        if (!seen && g_caught_n < MAX_CAUGHT)
+            g_caught[g_caught_n++] = d;
+        /* Restore the byte and re-run the real instruction; the probe re-arms. */
+        if (VirtualProtect((void *)(uintptr_t)FACTORY_TYPE_READ, 1,
+                           PAGE_EXECUTE_READWRITE, &prot)) {
+            *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ = g_orig_byte;
+            VirtualProtect((void *)(uintptr_t)FACTORY_TYPE_READ, 1, prot, &prot);
+        }
+        ep->ContextRecord->Eip = FACTORY_TYPE_READ;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static int g_orig_saved;
+
+static int arm_factory_bp(void)
+{
+    DWORD prot;
+    unsigned char cur = *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ;
+    if (cur == 0xCC) return 1;                 /* already armed */
+    if (!g_orig_saved) { g_orig_byte = cur; g_orig_saved = 1; }
+    if (!VirtualProtect((void *)(uintptr_t)FACTORY_TYPE_READ, 1,
+                        PAGE_EXECUTE_READWRITE, &prot))
+        return 0;
+    *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ = 0xCC;
+    VirtualProtect((void *)(uintptr_t)FACTORY_TYPE_READ, 1, prot, &prot);
+    return 1;
 }
 
 static DWORD WINAPI probe_main(LPVOID unused)
 {
-    DWORD lists[MAX_OBJ];
+    DWORD lists[MAX_OBJ], texts[MAX_OBJ];
     int nl, i, t, marker;
-    int na = 0, nw = 0;
-    char *defname;
-    char want[16], repl[16];
-    DWORD menu = 0, count = 0;
-    DWORD ours = 0, ref = 0;
+    DWORD begin = 0, count = 0, menu = 0;
+    DWORD btn_a = 0, btn_b = 0;
 
     (void)unused;
     g_own_stack = &marker;
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) return 0;
 
-    plog("=== re-probe: add \"Crossover\" to the main menu ===");
+    plog("=== re-probe: map the UI definition structure ===");
 
-    /* 1. Point the menu-definition pushes at the 7-entry variant. */
-    defname = (char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!defname) { plog("!! VirtualAlloc failed"); goto done; }
-    strcpy(defname, "UI_FRONTEND_MAIN_MENU");
-    plog("definition -> \"%s\" @ 0x%08lX", defname, (DWORD)(uintptr_t)defname);
-    plog("patch no-continue operand: %s",
-         patch_dword(PUSH_IMM_NO_CONTINUE, (DWORD)(uintptr_t)defname) ? "ok" : "FAILED");
-    plog("patch main operand:        %s",
-         patch_dword(PUSH_IMM_MAIN, (DWORD)(uintptr_t)defname) ? "ok" : "FAILED");
+    AddVectoredExceptionHandler(1, bp_handler);
+    plog("factory breakpoint at 0x%08X: %s", FACTORY_TYPE_READ,
+         arm_factory_bp() ? "armed" : "FAILED");
 
-    /* 2. Rewrite the label continuously, so it is in place before the glyphs
-     *    are baked at screen construction. */
-    want[0]='X'; want[1]='b'; want[2]='o'; want[3]='x'; want[4]=' ';
-    want[5]='L'; want[6]='i'; want[7]='v'; want[8]='e'; want[9]=0;
-    repl[0]='C'; repl[1]='r'; repl[2]='o'; repl[3]='s'; repl[4]='s';
-    repl[5]='o'; repl[6]='v'; repl[7]='e'; repl[8]='r'; repl[9]=0;
-
-    /* Relabel continuously so it lands before the glyphs are baked at screen
-     * construction. Restricted to heap memory: the live text buffers are on the
-     * heap, and sweeping the mapped image as well was both slow and crashed the
-     * game. */
-    /* Construction time varies run to run (intro video length, save state), so
-     * sweep from t=0 across a wide window. With the first-byte reject each pass
-     * is cheap enough that this does not disturb the game. */
-    for (t = 0; t < 110; t++) {
-        relabel_pass(want, repl, 9, &na, &nw);
-        Sleep(400);
+    /* Re-arm tightly: components are constructed in a burst, and each hit
+     * disarms the breakpoint, so a slow cadence samples almost nothing. */
+    for (t = 0; t < 60000 && g_caught_n < MAX_CAUGHT; t++) {
+        arm_factory_bp();
+        Sleep(1);
     }
-    plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
-    plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
+    plog("tight re-arm finished, %ld definitions captured", g_caught_n);
 
-    /* 3. Locate our entry and a normal one, then diff them to find the field
-     *    responsible for the larger text. */
-    /* The menu is not always up at a fixed time, so retry rather than sample
-     * once and give up. */
-    for (t = 0; t < 40 && !(ours && ref); t++) {
-    nl = scan_dword(VT_FRONTEND_LIST, lists, MAX_OBJ);
-    if (nl > MAX_OBJ) nl = MAX_OBJ;
-
-    for (i = 0; i < nl && !menu; i++) {
-        DWORD b, e, n, k;
-        if (IsBadReadPtr((void *)(uintptr_t)(lists[i] + VEC_CAP), 4)) continue;
-        b = *(DWORD *)(uintptr_t)(lists[i] + VEC_BEGIN);
-        e = *(DWORD *)(uintptr_t)(lists[i] + VEC_END);
-        if (b < 0x10000 || e <= b || (e - b) % 4 || (e - b) > 0x400) continue;
-        n = (e - b) / 4;
-        for (k = 0; k < n; k++) {
-            DWORD btn = *(DWORD *)(uintptr_t)(b + k * 4);
-            const char *nm = button_defname(btn);
-            if (!nm) continue;
-            if (strcmp(nm, "UI_FRONTEND_BUTTON_LIVE_AWARE") == 0) {
-                menu = lists[i]; count = n; ours = btn;
+    for (t = 0; t < 30 && !menu; t++) {
+        Sleep(2000);
+        nl = scan_dword(VT_FRONTEND_LIST, lists, MAX_OBJ);
+        if (nl > MAX_OBJ) nl = MAX_OBJ;
+        for (i = 0; i < nl && !menu; i++) {
+            DWORD b, e, n, k;
+            if (IsBadReadPtr((void *)(uintptr_t)(lists[i] + VEC_CAP), 4)) continue;
+            b = *(DWORD *)(uintptr_t)(lists[i] + VEC_BEGIN);
+            e = *(DWORD *)(uintptr_t)(lists[i] + VEC_END);
+            if (b < 0x10000 || e <= b || (e - b) % 4 || (e - b) > 0x400) continue;
+            n = (e - b) / 4;
+            for (k = 0; k < n; k++) {
+                const char *nm = comp_defname(*(DWORD *)(uintptr_t)(b + k * 4));
+                if (nm && strcmp(nm, "UI_FRONTEND_BUTTON_QUIT") == 0) {
+                    menu = lists[i]; begin = b; count = n;
+                }
             }
-            if (strcmp(nm, "UI_FRONTEND_BUTTON_CREDITS") == 0) ref = btn;
         }
     }
+    if (!menu) plog("(main menu not located this run -- capture is independent of it)");
 
-        if (!(ours && ref)) Sleep(2000);
+    if (menu) {
+        plog("main menu list 0x%08lX, %lu children", menu, count);
+        btn_a = *(DWORD *)(uintptr_t)(begin + 0);
+        btn_b = *(DWORD *)(uintptr_t)(begin + (count - 1) * 4);
+        plog("  A 0x%08lX  %s", btn_a, comp_defname(btn_a));
+        plog("  B 0x%08lX  %s", btn_b, comp_defname(btn_b));
     }
 
-    if (!ours || !ref) { plog("!! could not locate both buttons"); goto done; }
-    plog("");
-    plog("our entry (LIVE_AWARE) = 0x%08lX", ours);
-    plog("reference (CREDITS)    = 0x%08lX", ref);
-    plog("menu list 0x%08lX, %lu children", menu, count);
-
-    /*
-     * NOT style fields: +0x00C and +0x158 were tried and rejected. Their values
-     * swap between runs (ours=7/credits=1 one run, ours=1/credits=7 the next),
-     * so they track ordering or transient state, not text style. Writing them
-     * only perturbed the layout.
-     */
-
+    /* Fetch definitions by name through the game's own API. */
     {
-        float ours_y = *(float *)(uintptr_t)(ours + 0x38);
-        DWORD b2 = *(DWORD *)(uintptr_t)(menu + VEC_BEGIN);
-        DWORD e2 = *(DWORD *)(uintptr_t)(menu + VEC_END);
-        DWORD k;
-        int moved = 0;
-        for (k = 0; k < (e2 - b2) / 4; k++) {
-            DWORD btn = *(DWORD *)(uintptr_t)(b2 + k * 4);
-            float *y;
-            if (IsBadReadPtr((void *)(uintptr_t)(btn + 0x38), 4)) continue;
-            y = (float *)(uintptr_t)(btn + 0x38);
-            if (*y > ours_y) { *y += 22.0f; moved++; }
-        }
+        static const char *names[] = {
+            "UI_FRONTEND_BUTTON_QUIT",
+            "UI_FRONTEND_BUTTON_CREDITS",
+            "UI_FRONTEND_MAIN_MENU",
+            "UI_FRONTEND_BUTTON_LIVE_AWARE",
+        };
+        DWORD defs[4];
+        unsigned k;
+
         plog("");
-        plog("overlap fix: our row y=%.1f, pushed %d lower entries down by 22",
-             (double)ours_y, moved);
-    }
-
-    /* Keep the label rewritten while the menu is on screen, so it survives long
-     * enough to be inspected. */
-    for (t = 0; t < 60; t++) {
-        relabel_pass(want, repl, 9, &na, &nw);
-        Sleep(400);
-    }
-    plog("post-render relabel total: %d ascii + %d utf16", na, nw);
-
-    plog("");
-    plog("=== raw dwords differing between the two buttons ===");
-    plog("    (position rows differ legitimately; looking for a style/font id)");
-    for (i = 0; i + 4 <= 0x600; i += 4) {
-        DWORD a, b;
-        float fa, fb;
-        if (IsBadReadPtr((void *)(uintptr_t)(ours + (DWORD)i), 4)) continue;
-        if (IsBadReadPtr((void *)(uintptr_t)(ref + (DWORD)i), 4)) continue;
-        a = *(DWORD *)(uintptr_t)(ours + (DWORD)i);
-        b = *(DWORD *)(uintptr_t)(ref + (DWORD)i);
-        if (a == b) continue;
-        /* skip pointers -- they always differ and tell us nothing */
-        if (a > 0x00400000u && b > 0x00400000u) continue;
-        fa = *(float *)&a;
-        fb = *(float *)&b;
-        plog("    +0x%03X  ours=0x%08lX (%.3f)   credits=0x%08lX (%.3f)",
-             i, a, (double)fa, b, (double)fb);
+        plog("=== definitions captured from the factory ===");
+        plog("  distinct definitions: %ld", g_caught_n);
+        {
+            LONG i;
+            DWORD by_type[0x2C];
+            memset(by_type, 0, sizeof by_type);
+            for (i = 0; i < g_caught_n; i++) {
+                DWORD d = g_caught[i], ty;
+                if (IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4)) continue;
+                ty = *(DWORD *)(uintptr_t)(d + TYPE_OFF);
+                plog("    [%2ld] 0x%08lX  type=%2lu", i, d, ty);
+                if (ty < 0x2C && !by_type[ty]) by_type[ty] = d;
+            }
+            /* Dump one definition per distinct type, then diff two of a kind. */
+            for (i = 0; i < 0x2C; i++) {
+                char lbl[32];
+                if (!by_type[i]) continue;
+                sprintf(lbl, "type 0x%02lX", (unsigned long)i);
+                dump_def(lbl, by_type[i], DEF_DUMP);
+            }
+            {
+                DWORD a2 = 0, b2 = 0;
+                LONG j;
+                for (j = 0; j < g_caught_n; j++) {
+                    DWORD d = g_caught[j];
+                    if (IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4)) continue;
+                    if (*(DWORD *)(uintptr_t)(d + TYPE_OFF) != TYPE_FRONTEND_BUTTON) continue;
+                    if (!a2) a2 = d; else if (!b2) b2 = d;
+                }
+                if (a2 && b2) {
+                    int off;
+                    plog("");
+                    plog("  --- differing fields, two CFrontEndButton definitions ---");
+                    for (off = 0; off < DEF_DUMP; off += 4) {
+                        DWORD va = *(DWORD *)(uintptr_t)(a2 + (DWORD)off);
+                        DWORD vb = *(DWORD *)(uintptr_t)(b2 + (DWORD)off);
+                        char sa[64], sb[64];
+                        if (va == vb) continue;
+                        if (try_str(va, sa, sizeof sa) && try_str(vb, sb, sizeof sb))
+                            plog("    +0x%03X  A=\"%s\"  B=\"%s\"", off, sa, sb);
+                        else
+                            plog("    +0x%03X  A=0x%08lX  B=0x%08lX", off, va, vb);
+                    }
+                }
+            }
+        }
     }
 
 done:
     plog("");
-    plog("=== probe complete (game left running) ===");
+    plog("=== probe complete ===");
     fclose(g_log);
     g_log = NULL;
     return 0;

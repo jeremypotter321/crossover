@@ -15,9 +15,11 @@ BOTTLE  := $(HOME)/Library/Containers/com.isaacmarovitz.Whisky/Bottles/3230151B-
 GAME    := $(BOTTLE)/drive_c/Games/Fable
 WHISKY  := /Applications/Whisky.app/Contents/Resources/WhiskyCmd
 
+SRC ?= probe.c
+
 all: probe.dll inject.exe
 
-probe.dll: probe.c
+probe.dll: $(SRC)
 	$(CC) $(CFLAGS) -shared -o $@ $< -Wl,--enable-stdcall-fixup
 
 inject.exe: inject.c
