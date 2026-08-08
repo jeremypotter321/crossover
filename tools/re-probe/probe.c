@@ -140,8 +140,13 @@ static void relabel_pass(const char *want, const char *repl, int len,
               (unsigned char *)g_own_stack < next)) {
             unsigned char *q = (unsigned char *)mbi.BaseAddress;
             unsigned char *e2 = next - (len * 2);
+            unsigned char first = (unsigned char)want[0];
             for (; q <= e2; q++) {
                 DWORD prot, back;
+                /* Cheap reject: the overwhelming majority of bytes cannot start
+                 * either encoding, and skipping the memcmp keeps each sweep
+                 * light enough not to disturb the game. */
+                if (*q != first) continue;
                 if (memcmp(q, want, len) == 0) {
                     if (VirtualProtect(q, len, PAGE_READWRITE, &prot)) {
                         memcpy(q, repl, len);
@@ -200,9 +205,12 @@ static DWORD WINAPI probe_main(LPVOID unused)
      * construction. Restricted to heap memory: the live text buffers are on the
      * heap, and sweeping the mapped image as well was both slow and crashed the
      * game. */
-    for (t = 0; t < 50; t++) {
+    /* The screen is built around t≈12s; sweep across that window rather than
+     * continuously, so the game is disturbed as little as possible. */
+    Sleep(5000);
+    for (t = 0; t < 20; t++) {
         relabel_pass(want, repl, 9, &na, &nw);
-        Sleep(250);
+        Sleep(600);
     }
     plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
     plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
