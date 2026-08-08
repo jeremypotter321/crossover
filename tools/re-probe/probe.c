@@ -327,6 +327,7 @@ static DWORD call_this2(DWORD fn, DWORD thisp, DWORD a1, DWORD a2)
 #define FN_NAME_LOOKUP 0x009AD2E0u
 
 static DWORD g_defmgr;
+static DWORD g_child_vec;
 
 static DWORD get_def_by_name(const char *name)
 {
@@ -456,6 +457,125 @@ static int arm_factory_bp(void)
     return 1;
 }
 
+
+/*
+ * Attachment.
+ *
+ * The child list is NOT the 4-byte vector at CFrontEndList+0x164 (that is the
+ * ownership list; shrinking it never removed a rendered entry). The real one
+ * holds 8-byte refcounted pairs { component*, int* refcount } in a standard
+ * {begin,end,capacity} vector, and is appended to by:
+ *
+ *   0x00429C15  SmartPtr::SmartPtr(&tmp, component)   thiscall
+ *   0x00535AD0  vector::push_back(vec, &tmp)          thiscall, needs capacity
+ *   0x004291DE  SmartPtr::~SmartPtr(&tmp)             thiscall
+ *
+ * push_back only writes when end != capacity, so the vector is first relocated
+ * into our own buffer with headroom.
+ */
+#define FN_SMARTPTR_CTOR 0x00429C15u
+#define FN_VEC_PUSHBACK  0x00535AD0u
+#define FN_SMARTPTR_DTOR 0x004291DEu
+
+/* Find an 8-byte-stride run of pointers to any of `objs`; that run is a child
+ * vector's storage. Returns the run start, and its length in elements. */
+static DWORD find_child_storage(const DWORD *objs, int nobj, int *out_len)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *addr = NULL;
+    DWORD lo = 0xFFFFFFFFu, hi = 0;
+    int i;
+
+    for (i = 0; i < nobj; i++) {
+        if (objs[i] < lo) lo = objs[i];
+        if (objs[i] > hi) hi = objs[i];
+    }
+    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        if (region_ok(&mbi)) {
+            unsigned char *p = (unsigned char *)mbi.BaseAddress;
+            unsigned char *end = next - 0x20;
+            for (; p <= end; p += 4) {
+                DWORD v0 = *(DWORD *)p;
+                DWORD v1 = *(DWORD *)(p + 8);
+                DWORD v2 = *(DWORD *)(p + 16);
+                int m0 = 0, m1 = 0, m2 = 0;
+                if (v0 < lo || v0 > hi) continue;
+                for (i = 0; i < nobj; i++) {
+                    if (objs[i] == v0) m0 = 1;
+                    if (objs[i] == v1) m1 = 1;
+                    if (objs[i] == v2) m2 = 1;
+                }
+                if (m0 && m1 && m2) {
+                    int len = 0;
+                    unsigned char *q = p;
+                    while (q + 8 <= next) {
+                        DWORD v = *(DWORD *)q;
+                        int hit = 0;
+                        for (i = 0; i < nobj; i++) if (objs[i] == v) hit = 1;
+                        if (!hit) break;
+                        len++; q += 8;
+                    }
+                    if (out_len) *out_len = len;
+                    return (DWORD)(uintptr_t)p;
+                }
+            }
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
+    return 0;
+}
+
+
+/* Capture real attachments: INT3 on push_back records which vector each
+ * component goes into, which beats guessing at strides in memory. */
+#define MAX_ATTACH 32
+static volatile DWORD g_att_vec[MAX_ATTACH];
+static volatile DWORD g_att_comp[MAX_ATTACH];
+static volatile LONG  g_att_n;
+static unsigned char g_pb_orig;
+static int g_pb_saved;
+
+static LONG CALLBACK pushback_handler(EXCEPTION_POINTERS *ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        (DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress == FN_VEC_PUSHBACK) {
+        DWORD prot;
+        DWORD vec  = ep->ContextRecord->Ecx;
+        DWORD pair = *(DWORD *)(uintptr_t)(ep->ContextRecord->Esp + 4);
+        DWORD comp = 0;
+        if (pair > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)pair, 4))
+            comp = *(DWORD *)(uintptr_t)pair;
+        if (g_att_n < MAX_ATTACH) {
+            g_att_vec[g_att_n] = vec;
+            g_att_comp[g_att_n] = comp;
+            g_att_n++;
+        }
+        if (VirtualProtect((void *)(uintptr_t)FN_VEC_PUSHBACK, 1,
+                           PAGE_EXECUTE_READWRITE, &prot)) {
+            *(unsigned char *)(uintptr_t)FN_VEC_PUSHBACK = g_pb_orig;
+            VirtualProtect((void *)(uintptr_t)FN_VEC_PUSHBACK, 1, prot, &prot);
+        }
+        ep->ContextRecord->Eip = FN_VEC_PUSHBACK;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void arm_pushback_bp(void)
+{
+    DWORD prot;
+    unsigned char cur = *(unsigned char *)(uintptr_t)FN_VEC_PUSHBACK;
+    if (cur == 0xCC) return;
+    if (!g_pb_saved) { g_pb_orig = cur; g_pb_saved = 1; }
+    if (VirtualProtect((void *)(uintptr_t)FN_VEC_PUSHBACK, 1,
+                       PAGE_EXECUTE_READWRITE, &prot)) {
+        *(unsigned char *)(uintptr_t)FN_VEC_PUSHBACK = 0xCC;
+        VirtualProtect((void *)(uintptr_t)FN_VEC_PUSHBACK, 1, prot, &prot);
+    }
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD lists[MAX_OBJ], texts[MAX_OBJ];
@@ -472,6 +592,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
 
     AddVectoredExceptionHandler(1, bp_handler);
     AddVectoredExceptionHandler(1, entry_handler);
+    AddVectoredExceptionHandler(1, pushback_handler);
     plog("factory breakpoint at 0x%08X: %s", FACTORY_TYPE_READ,
          arm_factory_bp() ? "armed" : "FAILED");
 
@@ -480,6 +601,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
     for (t = 0; t < 60000 && g_caught_n < MAX_CAUGHT; t++) {
         arm_factory_bp();
         if (!g_fac_this) arm_entry_bp();
+        arm_pushback_bp();
         Sleep(1);
     }
     plog("tight re-arm finished, %ld definitions captured", g_caught_n);
@@ -523,6 +645,26 @@ static DWORD WINAPI probe_main(LPVOID unused)
         };
         DWORD defs[4];
         unsigned k;
+
+        plog("");
+        plog("=== attachments observed (vector <- component) ===");
+        plog("  captured %ld", g_att_n);
+        {
+            LONG j;
+            for (j = 0; j < g_att_n && j < MAX_ATTACH; j++) {
+                DWORD v = g_att_vec[j], c = g_att_comp[j];
+                const char *nm = c ? comp_defname(c) : 0;
+                DWORD vt = (c && !IsBadReadPtr((void *)(uintptr_t)c, 4))
+                           ? *(DWORD *)(uintptr_t)c : 0;
+                plog("  [%2ld] vec=0x%08lX (b=%08lX e=%08lX c=%08lX)  comp=0x%08lX vt=0x%08lX %s",
+                     j, v,
+                     IsBadReadPtr((void *)(uintptr_t)v, 12) ? 0 : *(DWORD *)(uintptr_t)v,
+                     IsBadReadPtr((void *)(uintptr_t)v, 12) ? 0 : *(DWORD *)(uintptr_t)(v + 4),
+                     IsBadReadPtr((void *)(uintptr_t)v, 12) ? 0 : *(DWORD *)(uintptr_t)(v + 8),
+                     c, vt, nm ? nm : "");
+                if (!g_child_vec) g_child_vec = v;
+            }
+        }
 
         plog("");
         plog("=== PROOF: build a component by calling the factory ===");

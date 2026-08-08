@@ -447,3 +447,49 @@ object, but nothing has yet placed it into a screen's draw set — and the draw 
 construction, as section 6 records. The next step is to hook the factory, let the game build
 a screen, and observe what the caller does with each returned component: whatever call
 follows the factory in that caller is the attach path.
+
+---
+
+## 11. Attachment — partially mapped, not yet functional
+
+### The create path is now complete
+
+```
+0x009AD410   name -> definition id          (returns the id in eax)
+0x0041D21B   factory(container, defId)      -> component
+             component->vtable[0x14C](arg)  -> initialise
+```
+
+The wrapper around `0x0041DB49` does exactly this: resolve an id, call the factory, then
+dispatch the component's own virtual at **`+0x14C`** to initialise it before returning. Any
+component we build should be initialised the same way.
+
+### One attach mechanism found, but it is not the general one
+
+`0x00535AD0` is a `push_back` of **8-byte refcounted pairs** `{ component*, int* refcount }`
+into a `{begin,end,capacity}` vector, paired with `0x00429C15` (construct the pair,
+allocating a 12-byte refcount block) and `0x004291DE` (release it). It only writes when
+`end != capacity`.
+
+```
+mov  [eax], esi            ; pair.ptr
+mov  [eax+4], edx          ; pair.refcount
+inc  dword ptr [edx]       ; refcount++
+add  dword ptr [ecx+4], 8  ; end += 8
+```
+
+**But it is not how menu components are attached.** Two independent checks:
+
+- Scanning memory for an 8-byte-stride run of the main menu's own buttons found **nothing**.
+- An INT3 on `0x00535AD0` across a whole frontend build captured **zero** calls.
+
+So this belongs to one specific caller (the `CList` path at `0x0053B871`), not the general
+component tree. Do not build on it without checking it fires for the container in question.
+
+### Next step
+
+Attachment happens in the **callers of the create-and-initialise wrapper**, not in the
+factory or the wrapper itself. The way to find it is the method that has worked throughout:
+INT3 the wrapper, capture its return address, and disassemble the caller immediately after
+the call — whatever it does with the returned component is the attach path. Guessing at
+container layouts has produced only false leads.
