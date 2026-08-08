@@ -407,3 +407,43 @@ with at least one 124-byte state carrying the banked asset id and coordinates, a
 the factory at `0x0041D21B`. Cloning an existing definition of the desired type and editing
 those fields is far safer than constructing one from nothing, because it inherits every field
 that is still unmapped.
+
+---
+
+## 10. Building a component — proven
+
+The construction loop works. Verified live by capturing a real factory invocation and then
+re-issuing it from an injected thread:
+
+```
+captured this=0x055E5780  arg1=0x0000025C      (604)
+factory returned component 0x086AED20
+component vtable = 0x012497E4                  -> CFrontEndScreen
+component def    = UI_FRONTEND_MEDIA_PLAYER_ERROR
+```
+
+**The factory does not take a definition pointer.** It takes a definition **id** and resolves
+the definition itself through the manager (`0x0042AEDA`). That id is the value at
+**`CUIDef+0x20`** — the captured `arg1` of 604 is exactly the `+0x20` field of the screen
+definition captured earlier.
+
+So the call is:
+
+```c
+void *component = CUIFactory::CreateComponent(container, def->GetDefId());
+```
+
+where `container` is an object holding a definition manager at `+0x64` — the screen or list
+the component is being built for. Both come free inside a `CUIFactory` hook, which is the
+natural place to add components to a screen while it is under construction.
+
+This also explains why `CUIDef` carries two integer ids: `+0x14` identifies the definition
+record, while `+0x20` is the handle the construction path is driven by.
+
+### The remaining unknown
+
+Construction is solved; **attachment is not**. A component built this way is a valid, live
+object, but nothing has yet placed it into a screen's draw set — and the draw set is fixed at
+construction, as section 6 records. The next step is to hook the factory, let the game build
+a screen, and observe what the caller does with each returned component: whatever call
+follows the factory in that caller is the attach path.

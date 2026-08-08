@@ -354,7 +354,6 @@ static DWORD get_def_by_name(const char *name)
  * pages tried earlier, which never fired).
  */
 #define FACTORY_TYPE_READ 0x0041D249u
-#define FACTORY_ENTRY     0x0041D21Bu
 
 #define MAX_CAUGHT 64
 static unsigned char g_orig_byte;
@@ -388,60 +387,6 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
 
 static int g_orig_saved;
 
-/* Captured from a real factory invocation: `this` (a container holding a
- * definition manager at +0x64) and arg1, the definition reference the factory
- * resolves. Re-invoking with the same pair must build the same component. */
-static volatile DWORD g_fac_this;
-static volatile DWORD g_fac_arg1;
-static unsigned char g_entry_orig;
-static int g_entry_saved;
-
-static LONG CALLBACK entry_handler(EXCEPTION_POINTERS *ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
-        (DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress == FACTORY_ENTRY) {
-        DWORD prot;
-        /* At the entry byte nothing is pushed yet: [esp] is the return
-         * address and [esp+4] is arg1. */
-        g_fac_this = ep->ContextRecord->Ecx;
-        g_fac_arg1 = *(DWORD *)(uintptr_t)(ep->ContextRecord->Esp + 4);
-        if (VirtualProtect((void *)(uintptr_t)FACTORY_ENTRY, 1,
-                           PAGE_EXECUTE_READWRITE, &prot)) {
-            *(unsigned char *)(uintptr_t)FACTORY_ENTRY = g_entry_orig;
-            VirtualProtect((void *)(uintptr_t)FACTORY_ENTRY, 1, prot, &prot);
-        }
-        ep->ContextRecord->Eip = FACTORY_ENTRY;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-static void arm_entry_bp(void)
-{
-    DWORD prot;
-    unsigned char cur = *(unsigned char *)(uintptr_t)FACTORY_ENTRY;
-    if (cur == 0xCC) return;
-    if (!g_entry_saved) { g_entry_orig = cur; g_entry_saved = 1; }
-    if (VirtualProtect((void *)(uintptr_t)FACTORY_ENTRY, 1,
-                       PAGE_EXECUTE_READWRITE, &prot)) {
-        *(unsigned char *)(uintptr_t)FACTORY_ENTRY = 0xCC;
-        VirtualProtect((void *)(uintptr_t)FACTORY_ENTRY, 1, prot, &prot);
-    }
-}
-
-static DWORD call_this1(DWORD fn, DWORD thisp, DWORD a1)
-{
-    DWORD ret;
-    __asm__ __volatile__(
-        "pushl %[a]\n\t"
-        "movl %[t], %%ecx\n\t"
-        "call *%[f]"
-        : "=a"(ret)
-        : [f]"r"(fn), [t]"r"(thisp), [a]"r"(a1)
-        : "ecx", "edx", "memory", "cc");
-    return ret;
-}
-
 static int arm_factory_bp(void)
 {
     DWORD prot;
@@ -471,7 +416,6 @@ static DWORD WINAPI probe_main(LPVOID unused)
     plog("=== re-probe: map the UI definition structure ===");
 
     AddVectoredExceptionHandler(1, bp_handler);
-    AddVectoredExceptionHandler(1, entry_handler);
     plog("factory breakpoint at 0x%08X: %s", FACTORY_TYPE_READ,
          arm_factory_bp() ? "armed" : "FAILED");
 
@@ -479,7 +423,6 @@ static DWORD WINAPI probe_main(LPVOID unused)
      * disarms the breakpoint, so a slow cadence samples almost nothing. */
     for (t = 0; t < 60000 && g_caught_n < MAX_CAUGHT; t++) {
         arm_factory_bp();
-        if (!g_fac_this) arm_entry_bp();
         Sleep(1);
     }
     plog("tight re-arm finished, %ld definitions captured", g_caught_n);
@@ -523,25 +466,6 @@ static DWORD WINAPI probe_main(LPVOID unused)
         };
         DWORD defs[4];
         unsigned k;
-
-        plog("");
-        plog("=== PROOF: build a component by calling the factory ===");
-        plog("  captured this=0x%08lX arg1=0x%08lX", g_fac_this, g_fac_arg1);
-        if (g_fac_this && g_fac_arg1) {
-            DWORD comp = call_this1(FACTORY_ENTRY, g_fac_this, g_fac_arg1);
-            plog("  factory returned component 0x%08lX", comp);
-            if (comp && !IsBadReadPtr((void *)(uintptr_t)comp, 4)) {
-                DWORD vt = *(DWORD *)(uintptr_t)comp;
-                const char *nm = comp_defname(comp);
-                plog("  component vtable = 0x%08lX", vt);
-                plog("  component def    = %s", nm ? nm : "(none)");
-                plog("  -> a natively constructed component");
-            } else {
-                plog("  !! factory returned nothing usable");
-            }
-        } else {
-            plog("  (never caught a factory invocation)");
-        }
 
         plog("");
         plog("=== definitions captured from the factory ===");

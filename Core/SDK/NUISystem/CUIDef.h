@@ -20,7 +20,7 @@ public:
     unsigned int id;            /* +0x14 per-definition id                 */
     char pad_0018[0x04];        /* +0x18                                   */
     void* manager_alias;        /* +0x1C same pointer as `manager`         */
-    unsigned int id2;           /* +0x20 second per-definition id          */
+    unsigned int def_id;        /* +0x20 id the factory is called with     */
     char pad_0024[0x18];        /* +0x24 .. +0x38                          */
     unsigned int type;          /* +0x3C EUIComponentType                  */
 
@@ -40,6 +40,9 @@ public:
      * thread, so this -- present on every definition -- is the reliable
      * handle to the manager. */
     void* GetManager() const { return manager; }
+
+    /* Pass this to CUIFactory::CreateComponent to build this component. */
+    unsigned int GetDefId() const { return def_id; }
 
     unsigned int GetStateCount() const
     {

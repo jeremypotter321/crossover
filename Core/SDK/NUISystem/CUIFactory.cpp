@@ -1,24 +1,24 @@
 #include "CUIFactory.h"
 
-void* (__thiscall* CUIFactory::OCreateComponent)(void*, CUIDef*) = nullptr;
+void* (__thiscall* CUIFactory::OCreateComponent)(void*, unsigned int) = nullptr;
 CUIFactory::OnComponentCreated CUIFactory::s_observer = nullptr;
 
-void* __fastcall CUIFactory::HCreateComponent(void* _this, void* _EDX, CUIDef* def)
+void* __fastcall CUIFactory::HCreateComponent(void* _this, void* _EDX, unsigned int defId)
 {
-    void* component = OCreateComponent(_this, def);
+    void* component = OCreateComponent(_this, defId);
 
     if (s_observer && component)
-        s_observer(_this, def, component);
+        s_observer(_this, defId, component);
 
     return component;
 }
 
-void* CUIFactory::CreateComponent(void* owner, CUIDef* def)
+void* CUIFactory::CreateComponent(void* container, unsigned int defId)
 {
-    if (!OCreateComponent || !def)
+    if (!OCreateComponent || !container || !defId)
         return nullptr;
 
-    return OCreateComponent(owner, def);
+    return OCreateComponent(container, defId);
 }
 
 void CUIFactory::SetObserver(OnComponentCreated callback)
