@@ -131,11 +131,19 @@ static void relabel_pass(const char *want, const char *repl, int len,
         /* Never write into executable pages: making them PAGE_READWRITE strips
          * EXECUTE, and the game dies the moment it runs code there. Menu text
          * lives in data, so skipping code costs nothing. */
-        int writable_heap = mbi.State == MEM_COMMIT &&
-                            mbi.Type == MEM_PRIVATE &&
-                            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                            (mbi.Protect & PAGE_READWRITE) != 0;
-        if (writable_heap && !(g_own_stack &&
+        /* Cover heap, mapped files and the exe's own data -- the copy the menu
+         * actually reads is NOT on the heap (a heap-only sweep found 4 of the
+         * 9 live copies and the label did not change). Executable regions are
+         * excluded: making one PAGE_READWRITE strips EXECUTE and the game dies
+         * on the next instruction fetch there. Menu text is never in code. */
+        int candidate = mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                        !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                         PAGE_EXECUTE_READWRITE |
+                                         PAGE_EXECUTE_WRITECOPY)) &&
+                        (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
+                                        PAGE_WRITECOPY)) != 0;
+        if (candidate && !(g_own_stack &&
               (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
               (unsigned char *)g_own_stack < next)) {
             unsigned char *q = (unsigned char *)mbi.BaseAddress;
@@ -205,12 +213,12 @@ static DWORD WINAPI probe_main(LPVOID unused)
      * construction. Restricted to heap memory: the live text buffers are on the
      * heap, and sweeping the mapped image as well was both slow and crashed the
      * game. */
-    /* The screen is built around t≈12s; sweep across that window rather than
-     * continuously, so the game is disturbed as little as possible. */
-    Sleep(5000);
-    for (t = 0; t < 20; t++) {
+    /* Construction time varies run to run (intro video length, save state), so
+     * sweep from t=0 across a wide window. With the first-byte reject each pass
+     * is cheap enough that this does not disturb the game. */
+    for (t = 0; t < 110; t++) {
         relabel_pass(want, repl, 9, &na, &nw);
-        Sleep(600);
+        Sleep(400);
     }
     plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
     plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
@@ -250,25 +258,13 @@ static DWORD WINAPI probe_main(LPVOID unused)
     plog("reference (CREDITS)    = 0x%08lX", ref);
     plog("menu list 0x%08lX, %lu children", menu, count);
 
-    /* The Xbox Live entry renders in a larger font than its neighbours.
-     * +0x00C is 7 on it and 1 on every normal entry -- a style/type id. Match
-     * it so the new entry is typeset like the rest of the menu. */
-    {
-        DWORD *style = (DWORD *)(uintptr_t)(ours + 0x0C);
-        DWORD was = *style;
-        DWORD want_style = *(DWORD *)(uintptr_t)(ref + 0x0C);
-        *style = want_style;
-        plog("");
-        plog("style +0x00C: %lu -> %lu (matching CREDITS)", was, *style);
-    }
-
     /*
-     * The oversized text is inherited from the Xbox Live definition and is
-     * baked at construction, so it cannot be scaled from here. What CAN be
-     * fixed live is the resulting overlap: push every entry below ours further
-     * down so the taller row has clear space. +0x038 is the render position,
-     * verified by moving a live button on screen.
+     * NOT style fields: +0x00C and +0x158 were tried and rejected. Their values
+     * swap between runs (ours=7/credits=1 one run, ours=1/credits=7 the next),
+     * so they track ordering or transient state, not text style. Writing them
+     * only perturbed the layout.
      */
+
     {
         float ours_y = *(float *)(uintptr_t)(ours + 0x38);
         DWORD b2 = *(DWORD *)(uintptr_t)(menu + VEC_BEGIN);
@@ -280,12 +276,20 @@ static DWORD WINAPI probe_main(LPVOID unused)
             float *y;
             if (IsBadReadPtr((void *)(uintptr_t)(btn + 0x38), 4)) continue;
             y = (float *)(uintptr_t)(btn + 0x38);
-            if (*y > ours_y) { *y += 14.0f; moved++; }
+            if (*y > ours_y) { *y += 22.0f; moved++; }
         }
         plog("");
-        plog("overlap fix: our row y=%.1f, pushed %d lower entries down by 14",
+        plog("overlap fix: our row y=%.1f, pushed %d lower entries down by 22",
              (double)ours_y, moved);
     }
+
+    /* Keep the label rewritten while the menu is on screen, so it survives long
+     * enough to be inspected. */
+    for (t = 0; t < 60; t++) {
+        relabel_pass(want, repl, 9, &na, &nw);
+        Sleep(400);
+    }
+    plog("post-render relabel total: %d ascii + %d utf16", na, nw);
 
     plog("");
     plog("=== raw dwords differing between the two buttons ===");
