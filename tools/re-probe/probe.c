@@ -155,9 +155,15 @@ static void fmt_val(DWORD v, char *out, int cap)
 /* Dump the vector at def+0x40..+0x48. It is not empty (begin != end) and
  * begin+size == capacity, so it is a packed array -- the natural home for the
  * per-component properties that the scalar diff does not account for. */
+static void dump_vec_at(const char *label, DWORD def, int base, int elem);
+
 static void dump_def_vector(const char *label, DWORD def)
 {
     DWORD begin, end, cap, bytes, i;
+    /* CUIDef holds a second vector at +0x70..+0x78. Screens build their own
+     * children during init, so a child-definition list in the definition is
+     * the only thing that could drive which children appear. */
+    dump_vec_at(label, def, 0x70, 4);
     if (IsBadReadPtr((void *)(uintptr_t)(def + 0x48), 4)) return;
     begin = *(DWORD *)(uintptr_t)(def + 0x40);
     end   = *(DWORD *)(uintptr_t)(def + 0x44);
@@ -229,6 +235,25 @@ static void diff_states(DWORD d1, DWORD d2, unsigned long ty)
         plog("    +0x%03X  %08lX %-12s |  %08lX %s", off, va, sa, vb, sb);
     }
     plog("    (%d differing fields of %d)", ndiff, UISTATE_SIZE / 4);
+}
+
+static void dump_vec_at(const char *label, DWORD def, int base, int elem)
+{
+    DWORD b, e, n, i;
+    if (IsBadReadPtr((void *)(uintptr_t)(def + (DWORD)base + 8), 4)) return;
+    b = *(DWORD *)(uintptr_t)(def + (DWORD)base);
+    e = *(DWORD *)(uintptr_t)(def + (DWORD)base + 4);
+    if (b < 0x10000 || e <= b || (e - b) > 0x800) return;
+    n = (e - b) / (DWORD)elem;
+    plog("");
+    plog("  %s vector@+0x%02X: %lu element(s) of %d bytes  [0x%08lX..0x%08lX]",
+         label, base, n, elem, b, e);
+    for (i = 0; i < n && i < 32; i++) {
+        DWORD v = *(DWORD *)(uintptr_t)(b + i * (DWORD)elem);
+        char d[80];
+        fmt_val(v, d, sizeof d);
+        plog("    [%2lu] %08lX  %s", i, v, d);
+    }
 }
 
 static void dump_def(const char *label, DWORD def, int size)
@@ -361,6 +386,7 @@ static DWORD get_def_by_name(const char *name)
 static unsigned char g_orig_byte;
 static volatile DWORD g_caught[MAX_CAUGHT];
 static volatile LONG  g_caught_n;
+static volatile LONG  g_patched_screens;
 
 static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
 {
@@ -375,6 +401,33 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
             if (g_caught[i] == d) { seen = 1; break; }
         if (!seen && g_caught_n < MAX_CAUGHT)
             g_caught[g_caught_n++] = d;
+
+        /* ATTACHMENT TEST. This fires after the definition is resolved and
+         * before the component is built, so the child list can still be
+         * changed. Append a duplicate of the first child to every screen
+         * definition: if children really come from CUIDef+0x70, each screen
+         * gains one extra element. */
+        if (!seen && !IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4) &&
+            *(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x0A &&
+            !IsBadReadPtr((void *)(uintptr_t)(d + 0x78), 4)) {
+            DWORD b = *(DWORD *)(uintptr_t)(d + 0x70);
+            DWORD e = *(DWORD *)(uintptr_t)(d + 0x74);
+            if (b > 0x10000 && e > b && (e - b) < 0x400) {
+                DWORD n = (e - b) / 4;
+                DWORD *nv = (DWORD *)VirtualAlloc(NULL, (n + 2) * 4,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (nv) {
+                    DWORD k;
+                    for (k = 0; k < n; k++)
+                        nv[k] = *(DWORD *)(uintptr_t)(b + k * 4);
+                    nv[n] = nv[0];                    /* duplicate first child */
+                    *(DWORD *)(uintptr_t)(d + 0x70) = (DWORD)(uintptr_t)nv;
+                    *(DWORD *)(uintptr_t)(d + 0x74) = (DWORD)(uintptr_t)(nv + n + 1);
+                    *(DWORD *)(uintptr_t)(d + 0x78) = (DWORD)(uintptr_t)(nv + n + 1);
+                    g_patched_screens++;
+                }
+            }
+        }
         /* Restore the byte and re-run the real instruction; the probe re-arms. */
         if (VirtualProtect((void *)(uintptr_t)FACTORY_TYPE_READ, 1,
                            PAGE_EXECUTE_READWRITE, &prot)) {
@@ -576,6 +629,66 @@ static void arm_pushback_bp(void)
     }
 }
 
+
+/*
+ * Find the attach path.
+ *
+ * 0x0041DB4E is the instruction right after the wrapper's `call factory`, so at
+ * that point EAX is the freshly built component and [EBP+4] is the wrapper's
+ * own return address -- i.e. the caller that is about to do something with the
+ * component. Whatever that caller does next IS the attach.
+ */
+#define WRAPPER_AFTER_FACTORY 0x0041DB4Eu
+
+#define MAX_RET 16
+static volatile DWORD g_ret[MAX_RET];
+static volatile DWORD g_ret_comp[MAX_RET];
+static volatile LONG  g_ret_n;
+static unsigned char g_wr_orig;
+static int g_wr_saved;
+
+static LONG CALLBACK wrapper_handler(EXCEPTION_POINTERS *ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        (DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress == WRAPPER_AFTER_FACTORY) {
+        DWORD prot;
+        DWORD ebp = ep->ContextRecord->Ebp;
+        DWORD ret = 0;
+        LONG i;
+        int seen = 0;
+        if (ebp > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)(ebp + 4), 4))
+            ret = *(DWORD *)(uintptr_t)(ebp + 4);
+        for (i = 0; i < g_ret_n; i++)
+            if (g_ret[i] == ret) { seen = 1; break; }
+        if (!seen && ret && g_ret_n < MAX_RET) {
+            g_ret[g_ret_n] = ret;
+            g_ret_comp[g_ret_n] = ep->ContextRecord->Eax;
+            g_ret_n++;
+        }
+        if (VirtualProtect((void *)(uintptr_t)WRAPPER_AFTER_FACTORY, 1,
+                           PAGE_EXECUTE_READWRITE, &prot)) {
+            *(unsigned char *)(uintptr_t)WRAPPER_AFTER_FACTORY = g_wr_orig;
+            VirtualProtect((void *)(uintptr_t)WRAPPER_AFTER_FACTORY, 1, prot, &prot);
+        }
+        ep->ContextRecord->Eip = WRAPPER_AFTER_FACTORY;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void arm_wrapper_bp(void)
+{
+    DWORD prot;
+    unsigned char cur = *(unsigned char *)(uintptr_t)WRAPPER_AFTER_FACTORY;
+    if (cur == 0xCC) return;
+    if (!g_wr_saved) { g_wr_orig = cur; g_wr_saved = 1; }
+    if (VirtualProtect((void *)(uintptr_t)WRAPPER_AFTER_FACTORY, 1,
+                       PAGE_EXECUTE_READWRITE, &prot)) {
+        *(unsigned char *)(uintptr_t)WRAPPER_AFTER_FACTORY = 0xCC;
+        VirtualProtect((void *)(uintptr_t)WRAPPER_AFTER_FACTORY, 1, prot, &prot);
+    }
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD lists[MAX_OBJ], texts[MAX_OBJ];
@@ -593,6 +706,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
     AddVectoredExceptionHandler(1, bp_handler);
     AddVectoredExceptionHandler(1, entry_handler);
     AddVectoredExceptionHandler(1, pushback_handler);
+    AddVectoredExceptionHandler(1, wrapper_handler);
     plog("factory breakpoint at 0x%08X: %s", FACTORY_TYPE_READ,
          arm_factory_bp() ? "armed" : "FAILED");
 
@@ -602,6 +716,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
         arm_factory_bp();
         if (!g_fac_this) arm_entry_bp();
         arm_pushback_bp();
+        arm_wrapper_bp();
         Sleep(1);
     }
     plog("tight re-arm finished, %ld definitions captured", g_caught_n);
@@ -647,6 +762,20 @@ static DWORD WINAPI probe_main(LPVOID unused)
         unsigned k;
 
         plog("");
+        plog("=== callers of the create wrapper (the attach sites) ===");
+        plog("  distinct callers: %ld", g_ret_n);
+        {
+            LONG j;
+            for (j = 0; j < g_ret_n && j < MAX_RET; j++) {
+                DWORD c = g_ret_comp[j];
+                DWORD vt = (c > 0x10000 && !IsBadReadPtr((void *)(uintptr_t)c, 4))
+                           ? *(DWORD *)(uintptr_t)c : 0;
+                plog("  [%2ld] returns to 0x%08lX   component=0x%08lX vt=0x%08lX",
+                     j, g_ret[j], c, vt);
+            }
+        }
+
+        plog("");
         plog("=== attachments observed (vector <- component) ===");
         plog("  captured %ld", g_att_n);
         {
@@ -688,6 +817,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
         plog("");
         plog("=== definitions captured from the factory ===");
         plog("  distinct definitions: %ld", g_caught_n);
+        plog("  screen child lists extended: %ld", g_patched_screens);
         {
             LONG i;
             DWORD by_type[0x2C];

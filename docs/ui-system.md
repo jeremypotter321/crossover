@@ -493,3 +493,68 @@ factory or the wrapper itself. The way to find it is the method that has worked 
 INT3 the wrapper, capture its return address, and disassemble the caller immediately after
 the call — whatever it does with the returned component is the attach path. Guessing at
 container layouts has produced only false leads.
+
+---
+
+## 12. ATTACHMENT FOUND — `CUIDef+0x70` is the child list
+
+A screen does not have components pushed into it. **It builds its own children, at
+construction, from a list of definition ids in its own definition.**
+
+```
+CUIDef +0x70   begin      std::vector<uint32>  child definition ids
+       +0x74   end
+       +0x78   capacity
+```
+
+Dumped from a live `CFrontEndScreen` definition (type `0x0A`):
+
+```
+5 elements of 4 bytes:  605, 685, 120, 578, 606
+```
+
+Those are **definition ids** — the same values the factory takes as `arg1` (the captured
+`604` earlier). So a screen's content is authored as a list of child definitions, and the
+build is: for each id, resolve the definition, run it through the factory, initialise via
+`vtable[0x14C]`.
+
+### Why every earlier attempt failed
+
+This single fact explains all of it, and each failure was actually consistent evidence:
+
+- The drawn set is fixed at construction **because it is authored in the definition**.
+- Appending to `CFrontEndList+0x164` did nothing — that vector is downstream bookkeeping,
+  not the source of truth.
+- Shrinking that vector did not remove a rendered entry, for the same reason.
+- Swapping the *whole definition* to `UI_FRONTEND_MAIN_MENU` DID add an entry — because a
+  different definition carries a different child-id list. That worked by accident of being
+  the only thing that touched the real mechanism.
+
+### How to attach a component
+
+Append a definition id to the screen's child list **before the screen is constructed**. The
+window is exactly the factory breakpoint at `0x0041D249`: the definition has been resolved
+but the component has not been built yet.
+
+Because the vector is exactly sized (`end == capacity`), relocate it:
+
+```c
+/* at 0x0041D249, with `def` = EBX and def type == 0x0A */
+DWORD b = *(DWORD *)(def + 0x70), e = *(DWORD *)(def + 0x74);
+DWORD n = (e - b) / 4;
+DWORD *nv = VirtualAlloc(NULL, (n + 2) * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+memcpy(nv, (void *)b, n * 4);
+nv[n] = my_child_def_id;
+*(DWORD *)(def + 0x70) = (DWORD)nv;
+*(DWORD *)(def + 0x74) = (DWORD)(nv + n + 1);
+*(DWORD *)(def + 0x78) = (DWORD)(nv + n + 1);
+```
+
+Implemented in `tools/re-probe`, which extended 7–10 screen child lists per run with the
+game staying up.
+
+> **Not yet visually confirmed.** The runs that carried this change were blocked by Wine's
+> intermittent `0x80040218` video-playback dialog, which sits in front of the menu, so the
+> resulting screen was never photographed. The mechanism is evidenced by the data (child ids
+> in the definition, matching factory arg1 values, and the definition-swap result), not by a
+> screenshot. Clear the dialog with `wineserver -k` and re-run to confirm visually.

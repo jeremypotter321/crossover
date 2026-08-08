@@ -33,6 +33,15 @@ public:
     char pad_004C[0x0C];        /* +0x4C .. +0x54                          */
     float x;                    /* +0x58 position, seen 30.0 on a sprite    */
     float y;                    /* +0x5C position, seen 250.0 on a sprite   */
+    char pad_0060[0x10];        /* +0x60 .. +0x6C                          */
+
+    /* std::vector<unsigned int> of CHILD DEFINITION IDS. This is how a screen
+     * gets its content: at construction it walks this list, resolves each id
+     * and builds the component. Appending here -- before construction -- is
+     * the way to add a component to a screen. */
+    unsigned int* children_begin;   /* +0x70 */
+    unsigned int* children_end;     /* +0x74 */
+    unsigned int* children_cap;     /* +0x78 (== end; exactly sized)        */
 
     EUIComponentType GetType() const { return (EUIComponentType)type; }
 
@@ -53,6 +62,17 @@ public:
     CUIStateDef* GetState(unsigned int index)
     {
         return (index < GetStateCount()) ? &states_begin[index] : 0;
+    }
+
+    unsigned int GetChildCount() const
+    {
+        if (!children_begin || !children_end) return 0;
+        return (unsigned int)(children_end - children_begin);
+    }
+
+    unsigned int GetChildDefId(unsigned int index) const
+    {
+        return (index < GetChildCount()) ? children_begin[index] : 0;
     }
 };
 
