@@ -387,6 +387,9 @@ static unsigned char g_orig_byte;
 static volatile DWORD g_caught[MAX_CAUGHT];
 static volatile LONG  g_caught_n;
 static volatile LONG  g_patched_screens;
+static volatile DWORD g_text_def;      /* a CText definition we reuse   */
+static volatile DWORD g_text_id;       /* its id, for screen child lists */
+static volatile LONG  g_text_injected;
 
 static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
 {
@@ -402,13 +405,33 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
         if (!seen && g_caught_n < MAX_CAUGHT)
             g_caught[g_caught_n++] = d;
 
+        /* HELLO WORLD.
+         *
+         * Reuse a real CText definition so the component is built by the game
+         * with the game's own font, move it to the right via the definition's
+         * own x/y (CUIDef+0x58/+0x5C) -- which avoids needing the component's
+         * runtime X field, still unidentified -- and append its id to every
+         * screen's child list so the main menu picks it up. */
+        if (!IsBadReadPtr((void *)(uintptr_t)(d + 0x5C), 4) &&
+            *(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x06 &&
+            (!g_text_id || *(DWORD *)(uintptr_t)(d + 0x20) < g_text_id)) {
+            /* Lowest id wins, so the SAME definition is injected every run --
+             * "first resolved" varied per launch and kept changing the text. */
+            g_text_def = d;
+            g_text_id  = *(DWORD *)(uintptr_t)(d + 0x20);
+            *(float *)(uintptr_t)(d + 0x58) = 700.0f;   /* right side */
+            *(float *)(uintptr_t)(d + 0x5C) = 300.0f;
+            plog("  injecting CText def 0x%08lX id=%lu", d, g_text_id);
+        }
+
         /* ATTACHMENT TEST. This fires after the definition is resolved and
          * before the component is built, so the child list can still be
          * changed. Append a duplicate of the first child to every screen
          * definition: if children really come from CUIDef+0x70, each screen
          * gains one extra element. */
         if (!seen && !IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4) &&
-            *(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x0A &&
+            (*(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x0A ||
+             *(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x0C) &&
             !IsBadReadPtr((void *)(uintptr_t)(d + 0x78), 4)) {
             DWORD b = *(DWORD *)(uintptr_t)(d + 0x70);
             DWORD e = *(DWORD *)(uintptr_t)(d + 0x74);
@@ -420,7 +443,8 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
                     DWORD k;
                     for (k = 0; k < n; k++)
                         nv[k] = *(DWORD *)(uintptr_t)(b + k * 4);
-                    nv[n] = nv[0];                    /* duplicate first child */
+                    if (g_text_id) { nv[n] = g_text_id; g_text_injected++; }
+                    else            nv[n] = nv[n - 1];
                     *(DWORD *)(uintptr_t)(d + 0x70) = (DWORD)(uintptr_t)nv;
                     *(DWORD *)(uintptr_t)(d + 0x74) = (DWORD)(uintptr_t)(nv + n + 1);
                     *(DWORD *)(uintptr_t)(d + 0x78) = (DWORD)(uintptr_t)(nv + n + 1);
@@ -630,6 +654,87 @@ static void arm_pushback_bp(void)
 }
 
 
+/* Rewrite the injected text to "Hello World", and push it right.
+ *
+ * Patterns are assembled at runtime so the scan cannot rewrite its own needle
+ * (a literal here would be found and clobbered). The replacement is shorter
+ * than the needle, so it is NUL-terminated in place rather than padded.
+ * CUIDef+0x58 did not move the component, so the horizontal position must be a
+ * runtime field; several candidates are written at once and narrowed later. */
+static void say_one(const char *needle, int nlen);
+
+static void say_hello(void)
+{
+    /* Which CText definition gets injected varies per run, so rewrite every
+     * string we have seen it use. */
+    static const char n1[] = {'T','h','e','r','e',' ','i','s',' ','a',' ','p','r','o','b','l','e','m',0};
+    static const char n2[] = {'A','u','d','i','o',' ','O','p','t','i','o','n','s',0};
+    static const char n3[] = {'V','i','d','e','o',' ','O','p','t','i','o','n','s',0};
+    static const char n4[] = {'G','a','m','e',' ','O','p','t','i','o','n','s',0};
+    static const char n5[] = {'R','e','d','e','f','i','n','e',' ','K','e','y','s',0};
+    /* Only the long, distinctive needle. Short ones ("Game Options") match
+     * ~20 places and rewriting them all during startup killed the game. */
+    (void)n2; (void)n3; (void)n4; (void)n5;
+    say_one(n1, 18);
+}
+
+static void say_one(const char *needle_in, int nlen_in)
+{
+    char needle[24], repl[16];
+    unsigned short nw[24], rw[16];
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *addr = NULL;
+    int i, nlen, rlen, hits = 0;
+
+    nlen = nlen_in;
+    for (i = 0; i < nlen; i++) needle[i] = needle_in[i];
+    /* "Hello World" */
+    rlen = 0;
+    repl[rlen++]='H'; repl[rlen++]='e'; repl[rlen++]='l'; repl[rlen++]='l';
+    repl[rlen++]='o'; repl[rlen++]=' '; repl[rlen++]='W'; repl[rlen++]='o';
+    repl[rlen++]='r'; repl[rlen++]='l'; repl[rlen++]='d';
+
+    for (i = 0; i < nlen; i++) nw[i] = (unsigned short)(unsigned char)needle[i];
+    for (i = 0; i < rlen; i++) rw[i] = (unsigned short)(unsigned char)repl[i];
+
+    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        int writable = mbi.State == MEM_COMMIT &&
+                       !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                       !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+                       (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY));
+        if (writable && !(g_own_stack &&
+              (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
+              (unsigned char *)g_own_stack < next)) {
+            unsigned char *q = (unsigned char *)mbi.BaseAddress;
+            unsigned char *e2 = next - (nlen * 2) - 4;
+            for (; q <= e2; q++) {
+                DWORD prot, back;
+                if (*q != (unsigned char)needle[0]) continue;
+                if (memcmp(q, needle, nlen) == 0) {
+                    if (VirtualProtect(q, nlen + 1, PAGE_READWRITE, &prot)) {
+                        memcpy(q, repl, rlen);
+                        q[rlen] = 0;
+                        VirtualProtect(q, nlen + 1, prot, &back);
+                        hits++;
+                    }
+                } else if (memcmp(q, nw, nlen * 2) == 0) {
+                    if (VirtualProtect(q, nlen * 2 + 2, PAGE_READWRITE, &prot)) {
+                        memcpy(q, rw, rlen * 2);
+                        ((unsigned short *)q)[rlen] = 0;
+                        VirtualProtect(q, nlen * 2 + 2, prot, &back);
+                        hits++;
+                    }
+                }
+            }
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
+    if (hits) plog("  say_hello: rewrote %d occurrence(s) of a %d-char needle", hits, nlen);
+}
+
 /*
  * Find the attach path.
  *
@@ -689,6 +794,94 @@ static void arm_wrapper_bp(void)
     }
 }
 
+
+#define VT_CTEXT 0x01249CCCu
+
+/* Separate the duplicate we appended from its twin.
+ *
+ * A duplicated child inherits its twin's coordinates exactly, so the two draw
+ * on top of each other. The vertical value appears mirrored at +0x038, +0x040
+ * and +0x048 (stride 8), so the horizontal partner of each pair should be the
+ * preceding dword: +0x034, +0x03C, +0x044. Shifting all three moves the copy
+ * clear of the original. */
+static DWORD g_shifted[128];
+static int g_shifted_n;
+
+static int already_shifted(DWORD c)
+{
+    int k;
+    for (k = 0; k < g_shifted_n; k++)
+        if (g_shifted[k] == c) return 1;
+    if (g_shifted_n < 128) g_shifted[g_shifted_n++] = c;
+    return 0;
+}
+
+static void spread_duplicates(void)
+{
+    DWORD texts[64];
+    int n, i, j, moved = 0;
+
+    n = scan_dword(VT_CTEXT, texts, 64);
+    if (n > 64) n = 64;
+    plog("");
+    plog("=== separating duplicate text components (%d CText live) ===", n);
+
+    for (i = 0; i < n; i++) {
+        const char *ni = comp_defname(texts[i]);
+        float yi;
+        if (IsBadReadPtr((void *)(uintptr_t)(texts[i] + 0x48), 4)) continue;
+        yi = *(float *)(uintptr_t)(texts[i] + 0x38);
+        for (j = i + 1; j < n; j++) {
+            const char *nj = comp_defname(texts[j]);
+            float yj;
+            if (IsBadReadPtr((void *)(uintptr_t)(texts[j] + 0x48), 4)) continue;
+            yj = *(float *)(uintptr_t)(texts[j] + 0x38);
+            /* Overlap is about POSITION, not identity: the extra child is a
+             * different text component sitting at the same spot. Matching on
+             * def name missed it entirely. */
+            if (yi != yj) continue;
+            (void)ni; (void)nj;
+            if (already_shifted(texts[j])) break;   /* move once, never drift */
+
+            /* same definition AND same vertical position: a duplicate */
+            {
+                /* +0x038 is the one offset proven to move a component on
+                 * screen; the mirrors at +0x040/+0x048 move with it. */
+                float *y1 = (float *)(uintptr_t)(texts[j] + 0x38);
+                float *y2 = (float *)(uintptr_t)(texts[j] + 0x40);
+                float *y3 = (float *)(uintptr_t)(texts[j] + 0x48);
+                float was = *y1;
+                *y1 = was + 150.0f;
+                *y2 = was + 150.0f;
+                *y3 = was + 150.0f;
+                moved++;
+                plog("  moved 0x%08lX (%s) y %.1f -> %.1f",
+                     texts[j], nj ? nj : "?", (double)was, (double)*y1);
+            }
+            break;
+        }
+    }
+    plog("  separated %d duplicate(s)", moved);
+}
+
+
+
+/* Dismiss Wine's video-error dialog from inside the process.
+ *
+ * macOS-level clicking needs accessibility permission that osascript does not
+ * have here, but we are already injected -- so post the keystroke straight to
+ * the game's own window instead. */
+static void dismiss_dialogs(void)
+{
+    HWND hw = FindWindowA(NULL, "Fable - The Lost Chapters ");
+    if (!hw) hw = FindWindowA(NULL, "Fable - The Lost Chapters");
+    if (!hw) return;
+    PostMessageA(hw, WM_KEYDOWN, VK_RETURN, 0);
+    PostMessageA(hw, WM_KEYUP,   VK_RETURN, 0);
+    PostMessageA(hw, WM_KEYDOWN, VK_SPACE, 0);
+    PostMessageA(hw, WM_KEYUP,   VK_SPACE, 0);
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD lists[MAX_OBJ], texts[MAX_OBJ];
@@ -717,6 +910,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
         if (!g_fac_this) arm_entry_bp();
         arm_pushback_bp();
         arm_wrapper_bp();
+        if ((t & 0x3F) == 0) say_hello();   /* before glyphs are baked */
         Sleep(1);
     }
     plog("tight re-arm finished, %ld definitions captured", g_caught_n);
@@ -760,6 +954,33 @@ static DWORD WINAPI probe_main(LPVOID unused)
         };
         DWORD defs[4];
         unsigned k;
+
+        /* Structural check that does not depend on pixels: if the child list
+         * drove construction, the menu now has one more child than the six it
+         * ships with. Then offset the extra one so it is actually visible --
+         * a duplicate inherits its twin's coordinates and would otherwise draw
+         * exactly on top of it. */
+        {
+            int r;
+            for (r = 0; r < 90; r++) { say_hello(); dismiss_dialogs(); Sleep(400); }
+        }
+
+        plog("");
+        plog("=== ATTACHMENT RESULT ===");
+        plog("  main menu children = %lu  (stock is 6)", count);
+        if (count > 6) {
+            DWORD extra = *(DWORD *)(uintptr_t)(begin + (count - 1) * 4);
+            float *y = (float *)(uintptr_t)(extra + 0x38);
+            if (!IsBadReadPtr(y, 4)) {
+                float was = *y;
+                *y = was + 30.0f;
+                plog("  ATTACHED: extra child 0x%08lX (%s), y %.1f -> %.1f",
+                     extra, comp_defname(extra) ? comp_defname(extra) : "?",
+                     (double)was, (double)*y);
+            }
+        } else {
+            plog("  no extra child -- the append did not reach this list");
+        }
 
         plog("");
         plog("=== callers of the create wrapper (the attach sites) ===");
@@ -817,6 +1038,8 @@ static DWORD WINAPI probe_main(LPVOID unused)
         plog("");
         plog("=== definitions captured from the factory ===");
         plog("  distinct definitions: %ld", g_caught_n);
+        plog("  INJECTED CText def=0x%08lX id=%lu (injected %ld time(s))",
+             g_text_def, g_text_id, g_text_injected);
         plog("  screen child lists extended: %ld", g_patched_screens);
         {
             LONG i;
