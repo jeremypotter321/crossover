@@ -2,6 +2,7 @@
 
 #include "../Utils/Hook.h"
 #include "UITypes.h"
+#include "CUIStateDef.h"
 
 /*
  * CUIDef -- the definition a UI component is built from (vtable 0x01259F8C).
@@ -23,12 +24,33 @@ public:
     char pad_0024[0x18];        /* +0x24 .. +0x38                          */
     unsigned int type;          /* +0x3C EUIComponentType                  */
 
+    /* std::vector<CUIStateDef>: one record per visual state. This, not the
+     * scalars above, is where a component's appearance is authored. */
+    CUIStateDef* states_begin;  /* +0x40                                   */
+    CUIStateDef* states_end;    /* +0x44                                   */
+    CUIStateDef* states_cap;    /* +0x48 == states_end; exactly sized       */
+
+    char pad_004C[0x0C];        /* +0x4C .. +0x54                          */
+    float x;                    /* +0x58 position, seen 30.0 on a sprite    */
+    float y;                    /* +0x5C position, seen 250.0 on a sprite   */
+
     EUIComponentType GetType() const { return (EUIComponentType)type; }
 
     /* The definition-manager global at 0x013B879C reads NULL from an injected
      * thread, so this -- present on every definition -- is the reliable
      * handle to the manager. */
     void* GetManager() const { return manager; }
+
+    unsigned int GetStateCount() const
+    {
+        if (!states_begin || !states_end) return 0;
+        return (unsigned int)(states_end - states_begin);
+    }
+
+    CUIStateDef* GetState(unsigned int index)
+    {
+        return (index < GetStateCount()) ? &states_begin[index] : 0;
+    }
 };
 
 static_assert(sizeof(void*) == 4, "Fable is a 32-bit target");

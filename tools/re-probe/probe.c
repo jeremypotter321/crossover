@@ -37,7 +37,7 @@
 #define RDATA_LO 0x0122D000u
 #define RDATA_HI 0x01374000u
 
-#define DEF_DUMP 0xA0
+#define DEF_DUMP 0x140
 #define MAX_OBJ  64
 
 static FILE *g_log;
@@ -130,6 +130,105 @@ static int try_str(DWORD va, char *out, int cap)
     }
     out[i] = 0;
     return i >= 3;
+}
+
+
+/* Describe a raw dword. Order matters: a heap pointer reinterpreted as a float
+ * is a denormal that prints as "0.000", which hid the real fields on the first
+ * pass. Strings and pointers are therefore ruled out before floats. */
+static void fmt_val(DWORD v, char *out, int cap)
+{
+    float f = *(float *)&v;
+    char s[64];
+    if (v == 0) { snprintf(out, cap, "0"); return; }
+    if (try_str(v, s, sizeof s)) { snprintf(out, cap, "\"%s\"", s); return; }
+    if (v >= 0x00400000u && v < 0x10000000u &&
+        !IsBadReadPtr((void *)(uintptr_t)v, 4)) { snprintf(out, cap, "ptr"); return; }
+    if (v < 0x10000u) { snprintf(out, cap, "%lu", v); return; }
+    if ((f > 0.0009f && f < 100000.0f) || (f < -0.0009f && f > -100000.0f)) {
+        snprintf(out, cap, "%.2ff", (double)f); return;
+    }
+    snprintf(out, cap, "-");
+}
+
+
+/* Dump the vector at def+0x40..+0x48. It is not empty (begin != end) and
+ * begin+size == capacity, so it is a packed array -- the natural home for the
+ * per-component properties that the scalar diff does not account for. */
+static void dump_def_vector(const char *label, DWORD def)
+{
+    DWORD begin, end, cap, bytes, i;
+    if (IsBadReadPtr((void *)(uintptr_t)(def + 0x48), 4)) return;
+    begin = *(DWORD *)(uintptr_t)(def + 0x40);
+    end   = *(DWORD *)(uintptr_t)(def + 0x44);
+    cap   = *(DWORD *)(uintptr_t)(def + 0x48);
+    if (begin < 0x10000 || end <= begin) {
+        plog("  %s vector: begin=0x%08lX end=0x%08lX (empty)", label, begin, end);
+        return;
+    }
+    bytes = end - begin;
+    plog("");
+    plog("  %s vector @ 0x%08lX  %lu bytes  (end=0x%08lX cap=0x%08lX)",
+         label, begin, bytes, end, cap);
+    if (bytes > 0x400) bytes = 0x400;
+
+    for (i = 0; i + 4 <= bytes; i += 4) {
+        DWORD v;
+        char d[80];
+        if (IsBadReadPtr((void *)(uintptr_t)(begin + i), 4)) break;
+        v = *(DWORD *)(uintptr_t)(begin + i);
+        fmt_val(v, d, sizeof d);
+        /* if it points at something, try to read a string one hop in */
+        if (v >= 0x00400000u && v < 0x10000000u &&
+            !IsBadReadPtr((void *)(uintptr_t)v, 4)) {
+            char s2[64];
+            DWORD inner = *(DWORD *)(uintptr_t)v;
+            if (try_str(inner, s2, sizeof s2))
+                plog("    [%3lu] +0x%03lX  %08lX -> \"%s\"", i / 4, i, v, s2);
+            else if (try_str(v, s2, sizeof s2))
+                plog("    [%3lu] +0x%03lX  %08lX  \"%s\"", i / 4, i, v, s2);
+            else
+                plog("    [%3lu] +0x%03lX  %08lX  %s", i / 4, i, v, d);
+        } else {
+            plog("    [%3lu] +0x%03lX  %08lX  %s", i / 4, i, v, d);
+        }
+    }
+}
+
+
+#define UISTATE_SIZE 0x7C   /* sizeof(CUIStateDef), vtable 0x0125871C */
+
+/* Diff state[0] of two definitions of the same type. The per-state record is
+ * where the visuals live -- colour, scale, and the banked asset ids. */
+static void diff_states(DWORD d1, DWORD d2, unsigned long ty)
+{
+    DWORD b1, b2, e1, e2;
+    int off, ndiff = 0;
+    if (IsBadReadPtr((void *)(uintptr_t)(d1 + 0x48), 4)) return;
+    if (IsBadReadPtr((void *)(uintptr_t)(d2 + 0x48), 4)) return;
+    b1 = *(DWORD *)(uintptr_t)(d1 + 0x40);
+    e1 = *(DWORD *)(uintptr_t)(d1 + 0x44);
+    b2 = *(DWORD *)(uintptr_t)(d2 + 0x40);
+    e2 = *(DWORD *)(uintptr_t)(d2 + 0x44);
+    if (b1 < 0x10000 || b2 < 0x10000 || e1 <= b1 || e2 <= b2) return;
+
+    plog("");
+    plog("  === type 0x%02lX CUIStateDef[0] diff (%lu vs %lu states) ===",
+         ty, (e1 - b1) / UISTATE_SIZE, (e2 - b2) / UISTATE_SIZE);
+    for (off = 0; off < UISTATE_SIZE; off += 4) {
+        DWORD va, vb;
+        char sa[80], sb[80];
+        if (IsBadReadPtr((void *)(uintptr_t)(b1 + (DWORD)off), 4)) break;
+        if (IsBadReadPtr((void *)(uintptr_t)(b2 + (DWORD)off), 4)) break;
+        va = *(DWORD *)(uintptr_t)(b1 + (DWORD)off);
+        vb = *(DWORD *)(uintptr_t)(b2 + (DWORD)off);
+        if (va == vb) continue;
+        ndiff++;
+        fmt_val(va, sa, sizeof sa);
+        fmt_val(vb, sb, sizeof sb);
+        plog("    +0x%03X  %08lX %-12s |  %08lX %s", off, va, sa, vb, sb);
+    }
+    plog("    (%d differing fields of %d)", ndiff, UISTATE_SIZE / 4);
 }
 
 static void dump_def(const char *label, DWORD def, int size)
@@ -256,7 +355,7 @@ static DWORD get_def_by_name(const char *name)
  */
 #define FACTORY_TYPE_READ 0x0041D249u
 
-#define MAX_CAUGHT 24
+#define MAX_CAUGHT 64
 static unsigned char g_orig_byte;
 static volatile DWORD g_caught[MAX_CAUGHT];
 static volatile LONG  g_caught_n;
@@ -388,30 +487,46 @@ static DWORD WINAPI probe_main(LPVOID unused)
                 if (!by_type[i]) continue;
                 sprintf(lbl, "type 0x%02lX", (unsigned long)i);
                 dump_def(lbl, by_type[i], DEF_DUMP);
+                dump_def_vector(lbl, by_type[i]);
             }
             {
-                DWORD a2 = 0, b2 = 0;
-                LONG j;
-                for (j = 0; j < g_caught_n; j++) {
-                    DWORD d = g_caught[j];
-                    if (IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4)) continue;
-                    if (*(DWORD *)(uintptr_t)(d + TYPE_OFF) != TYPE_FRONTEND_BUTTON) continue;
-                    if (!a2) a2 = d; else if (!b2) b2 = d;
-                }
-                if (a2 && b2) {
-                    int off;
-                    plog("");
-                    plog("  --- differing fields, two CFrontEndButton definitions ---");
-                    for (off = 0; off < DEF_DUMP; off += 4) {
-                        DWORD va = *(DWORD *)(uintptr_t)(a2 + (DWORD)off);
-                        DWORD vb = *(DWORD *)(uintptr_t)(b2 + (DWORD)off);
-                        char sa[64], sb[64];
-                        if (va == vb) continue;
-                        if (try_str(va, sa, sizeof sa) && try_str(vb, sb, sizeof sb))
-                            plog("    +0x%03X  A=\"%s\"  B=\"%s\"", off, sa, sb);
-                        else
-                            plog("    +0x%03X  A=0x%08lX  B=0x%08lX", off, va, vb);
+                /* Diff every type with two or more captured definitions: fields
+                 * that differ between two definitions of the SAME type are the
+                 * per-instance content (position, size, asset ids) rather than
+                 * type machinery. */
+                DWORD ty;
+                for (ty = 0; ty < 0x2C; ty++) {
+                    DWORD d1 = 0, d2 = 0;
+                    LONG j;
+                    int off, ndiff = 0;
+                    for (j = 0; j < g_caught_n; j++) {
+                        DWORD d = g_caught[j];
+                        if (IsBadReadPtr((void *)(uintptr_t)(d + TYPE_OFF), 4)) continue;
+                        if (*(DWORD *)(uintptr_t)(d + TYPE_OFF) != ty) continue;
+                        if (!d1) d1 = d; else if (!d2) { d2 = d; break; }
                     }
+                    if (!d1 || !d2) continue;
+
+                    plog("");
+                    plog("  === type 0x%02lX : diff 0x%08lX vs 0x%08lX ===", ty, d1, d2);
+                    for (off = 0; off < DEF_DUMP; off += 4) {
+                        DWORD va, vb;
+                        float fa, fb;
+                        char sa[64], sb[64];
+                        if (IsBadReadPtr((void *)(uintptr_t)(d1 + (DWORD)off), 4)) continue;
+                        if (IsBadReadPtr((void *)(uintptr_t)(d2 + (DWORD)off), 4)) continue;
+                        va = *(DWORD *)(uintptr_t)(d1 + (DWORD)off);
+                        vb = *(DWORD *)(uintptr_t)(d2 + (DWORD)off);
+                        if (va == vb) continue;
+                        ndiff++;
+                        (void)fa; (void)fb;
+                        fmt_val(va, sa, sizeof sa);
+                        fmt_val(vb, sb, sizeof sb);
+                        plog("    +0x%03X  %08lX %-12s |  %08lX %s",
+                             off, va, sa, vb, sb);
+                    }
+                    plog("    (%d differing fields)", ndiff);
+                    diff_states(d1, d2, ty);
                 }
             }
         }

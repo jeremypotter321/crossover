@@ -344,3 +344,66 @@ id), which need diffing across two definitions of the *same* type — the captur
 collected only one `CFrontEndButton` definition, so that diff has not run yet. With those
 mapped, a definition can be cloned, edited and handed to the factory at `0x0041D21B` to
 produce a genuinely new, natively-styled component.
+
+---
+
+## 9. `CUIStateDef` — where the layout actually lives
+
+The scalar diff of two same-type definitions turns up very little, because most per-component
+content is not in `CUIDef` at all. `CUIDef+0x40` is a **`std::vector<CUIStateDef>`**:
+
+```
+CUIDef +0x40   begin
+       +0x44   end
+       +0x48   capacity          (== end: these vectors are exactly sized)
+       sizeof(CUIStateDef) = 0x7C (124)
+```
+
+`CUIStateDef` is confirmed by RTTI — the records begin with vtable `0x0125871C`, whose
+complete-object locator resolves to `.?AVCUIStateDef@NUISystem@@`.
+
+**A component has one record per visual state.** Observed live: `CSprite` 1 state, `CText`
+2 and 4, `CFrontEndScreen` 8. That is what makes a widget change appearance on hover, press
+and disable — and it means a component's *appearance* is per-state data, not a single value.
+
+### `CUIDef` scalar fields identified
+
+| offset | meaning |
+| --- | --- |
+| `+0x14`, `+0x18`, `+0x20` | per-definition integer ids |
+| `+0x40` … `+0x48` | `std::vector<CUIStateDef>` |
+| `+0x58` | float — position, e.g. `30.00f` on a sprite |
+| `+0x5C` | float — position, e.g. `250.00f` on a sprite |
+
+### `CUIStateDef` fields identified
+
+From diffing state `[0]` across definitions of the same type:
+
+| offset | observed | reading |
+| --- | --- | --- |
+| `+0x00` | vtable `0x0125871C` | `CUIStateDef` |
+| `+0x24` | `-256`, `-160`, `-144`, `-80`, `-8` | signed offset — negative multiples of 8/16 |
+| `+0x3C` | `273`, `50` | asset id — the banked graphic (`EFrontEndGraphicBank`) |
+| `+0x40` | `34`, `7` | second id |
+| `+0x48` | `256.0f`, `-140.0f`, `-80.0f`, `65.0f`, `60.0f` | coordinate / extent |
+| `+0x4C` | `44.0f`, `0` | coordinate / extent |
+| `+0x50` … `+0x64` | mostly `1.0f`, one `-1.0f` | colour and scale factors |
+| `+0x28` | `255` | alpha |
+
+The `1.0f` run at `+0x50`–`+0x64` with a trailing `-1.0f` is the shape of a colour/scale
+block left at defaults, which is consistent with an authored definition that only overrides
+what it needs.
+
+Semantics of the individual state fields are **inferred from value shape**, not yet proven
+by writing to them. The clean way to nail each one down is to write a distinctive value into
+a live state record and watch which visual property moves — the same method that proved
+`component+0x038` is the render position.
+
+### What this unlocks
+
+The pieces for authoring a native component are now all identified: pick a type from the
+catalogue, build a `CUIDef` with that type at `+0x3C`, give it a `std::vector<CUIStateDef>`
+with at least one 124-byte state carrying the banked asset id and coordinates, and hand it to
+the factory at `0x0041D21B`. Cloning an existing definition of the desired type and editing
+those fields is far safer than constructing one from nothing, because it inherits every field
+that is still unmapped.

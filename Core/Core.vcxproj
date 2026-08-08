@@ -180,6 +180,7 @@
     <ClInclude Include="SDK\Fable\SDK.h" />
     <ClInclude Include="SDK\NUISystem\UITypes.h" />
     <ClInclude Include="SDK\NUISystem\CUIDef.h" />
+    <ClInclude Include="SDK\NUISystem\CUIStateDef.h" />
     <ClInclude Include="SDK\NUISystem\CUIFactory.h" />
     <ClInclude Include="SDK\Fable\World.h" />
     <ClInclude Include="SDK\Fable\WorldMap.h" />
