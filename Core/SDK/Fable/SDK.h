@@ -30,6 +30,10 @@
 #include "PhysicsStandard.h"
 #include "RightHandedSet.h"
 
+#include "../NUISystem/UITypes.h"
+#include "../NUISystem/CUIDef.h"
+#include "../NUISystem/CUIFactory.h"
+
 class SDK
 {
 public:

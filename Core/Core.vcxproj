@@ -178,6 +178,9 @@
     <ClInclude Include="SDK\Fable\Player.h" />
     <ClInclude Include="SDK\Fable\PlayerManager.h" />
     <ClInclude Include="SDK\Fable\SDK.h" />
+    <ClInclude Include="SDK\NUISystem\UITypes.h" />
+    <ClInclude Include="SDK\NUISystem\CUIDef.h" />
+    <ClInclude Include="SDK\NUISystem\CUIFactory.h" />
     <ClInclude Include="SDK\Fable\World.h" />
     <ClInclude Include="SDK\Fable\WorldMap.h" />
     <ClInclude Include="SDK\Utils\Hook.h" />
@@ -228,6 +231,8 @@
     <ClCompile Include="SDK\Fable\Player.cpp" />
     <ClCompile Include="SDK\Fable\PlayerManager.cpp" />
     <ClCompile Include="SDK\Fable\SDK.cpp" />
+    <ClCompile Include="SDK\NUISystem\UITypes.cpp" />
+    <ClCompile Include="SDK\NUISystem\CUIFactory.cpp" />
     <ClCompile Include="SDK\Fable\WorldMap.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

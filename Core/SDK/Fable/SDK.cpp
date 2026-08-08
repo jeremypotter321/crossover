@@ -49,4 +49,8 @@ SDK::SDK()
 	CTCPhysicsControlled::Hook();
 	CTCPhysicsStandard::Hook();
 	CRightHandedSet::Hook();
+
+	/* UI: gives both a trampoline for building components ourselves and a
+	 * point to extend a screen while it is under construction. */
+	CUIFactory::Hook();
 };
