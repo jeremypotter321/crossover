@@ -1,21 +1,26 @@
 /*
- * re-probe: hook/patch harness for Fable's frontend, built from macOS.
+ * re-probe: adds a "Crossover" entry to Fable's main menu, from macOS.
  *
- * The real mod can only be built with MSVC (SLikeNet is a prebuilt MSVC C++
- * static lib), but a standalone probe has no such dependency and cross-compiles
- * cleanly with mingw-w64, giving a build/inject/observe loop that runs locally
- * under Wine instead of round-tripping through Windows CI.
+ * Cross-compiled with mingw-w64 and injected under Wine, giving a local
+ * build/inject/observe loop. (The full mod still needs MSVC because SLikeNet is
+ * a prebuilt MSVC C++ static lib; this probe links nothing.)
  *
- * What was established by the earlier read-only passes:
- *   - Fable.exe has no ASLR; it always loads at 0x400000.
- *   - A CFrontEndButton carries its definition name at
- *       *(char **)*(DWORD *)(button + 0x20)
- *   - A CFrontEndList owns its children in a std::vector<CFrontEndButton *>
- *     whose {begin,end,capacity} triple lives at list+0x164/+0x168/+0x16C.
- *   - The main menu is the list holding UI_FRONTEND_BUTTON_QUIT.
+ * How it works -- and why it works this way:
  *
- * This pass ADDS an entry to the main menu by cloning an existing button and
- * appending it to that vector.
+ *   Patching containers after the fact CANNOT add a menu entry. The
+ *   CFrontEndList child vector at +0x164 is an ownership list, not the draw
+ *   source: shrinking it still left the dropped entry rendering. The drawn set
+ *   is fixed when the screen is constructed.
+ *
+ *   So instead this changes WHICH DEFINITION the menu is built from, before
+ *   construction. sub_59899A selects the menu definition with a plain
+ *   `push imm32`; rewriting that operand to a string of our own makes the game
+ *   build a different menu through its own machinery. UI_FRONTEND_MAIN_MENU
+ *   (the Xbox Live variant, unused on PC) carries one extra entry.
+ *
+ *   The label is then rewritten from "Xbox Live" to "Crossover" -- same length,
+ *   so it is an in-place overwrite. It must run continuously from t=0 because
+ *   the text is baked to glyphs at construction.
  */
 
 #include <windows.h>
@@ -24,21 +29,21 @@
 
 #define LOG_PATH "probe.log"
 
-#define VT_FRONTEND_SCREEN 0x012497E4u
-#define VT_FRONTEND_BUTTON 0x01249554u
-#define VT_FRONTEND_LIST   0x01249224u
+#define VT_FRONTEND_LIST 0x01249224u
 
 #define VEC_BEGIN 0x164
 #define VEC_END   0x168
 #define VEC_CAP   0x16C
 
-#define BUTTON_CLONE_BYTES 0x400   /* ctor touches +0x1B0, so the object exceeds it */
+/* Operands of the two `push imm32` menu-definition selections in sub_59899A. */
+#define PUSH_IMM_NO_CONTINUE 0x005989E2u
+#define PUSH_IMM_MAIN        0x005989E9u
+
+#define SCAN_BYTES 0x400
 #define MAX_OBJ 64
 
 static FILE *g_log;
 static void *g_own_stack;
-static int   g_y_off = -1;      /* offset of the button's vertical position float */
-static float g_y_step = 0.0f;   /* spacing between menu rows */
 
 static void plog(const char *fmt, ...)
 {
@@ -58,14 +63,10 @@ static int region_ok(const MEMORY_BASIC_INFORMATION *mbi)
     if (g_own_stack && (unsigned char *)g_own_stack >= base &&
         (unsigned char *)g_own_stack < next)
         return 0;
-    /* Include MEM_IMAGE (the exe's own .data) and MEM_MAPPED, not just the
-     * heap -- a global draw list lives in .data and earlier passes, which
-     * filtered on MEM_PRIVATE, could never have seen it. */
     return mbi->State == MEM_COMMIT &&
            !(mbi->Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
            (mbi->Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE |
-                            PAGE_READONLY | PAGE_EXECUTE_READ |
-                            PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY));
+                            PAGE_READONLY | PAGE_EXECUTE_READ));
 }
 
 static int scan_dword(DWORD value, DWORD *out, int max_out)
@@ -89,7 +90,6 @@ static int scan_dword(DWORD value, DWORD *out, int max_out)
     return found;
 }
 
-/* Definition name of a button, or NULL. */
 static const char *button_defname(DWORD btn)
 {
     DWORD holder, str;
@@ -101,45 +101,117 @@ static const char *button_defname(DWORD btn)
     return (const char *)(uintptr_t)str;
 }
 
-static void identify_owner(DWORD site)
+static int patch_dword(DWORD at, DWORD value)
 {
-    static const struct { const char *name; DWORD vt; } kinds[] = {
-        { "CFrontEndManager", 0x012521A8u },
-        { "CFrontEndScreen",  VT_FRONTEND_SCREEN },
-        { "CFrontEndButton",  VT_FRONTEND_BUTTON },
-        { "CFrontEndList",    VT_FRONTEND_LIST   },
-    };
-    DWORD a;
-    for (a = site & ~3u; a > site - 0x4000 && a > 0x10000; a -= 4) {
-        DWORD v;
-        unsigned k;
-        if (IsBadReadPtr((void *)(uintptr_t)a, 4)) break;
-        v = *(DWORD *)(uintptr_t)a;
-        for (k = 0; k < sizeof kinds / sizeof kinds[0]; k++)
-            if (v == kinds[k].vt) {
-                plog("        owner %-17s 0x%08lX  at +0x%lX",
-                     kinds[k].name, a, site - a);
-                return;
-            }
+    DWORD old;
+    if (!VirtualProtect((void *)(uintptr_t)at, 4, PAGE_EXECUTE_READWRITE, &old))
+        return 0;
+    *(DWORD *)(uintptr_t)at = value;
+    VirtualProtect((void *)(uintptr_t)at, 4, old, &old);
+    return 1;
+}
+
+/* Rewrite every live copy of the label. Patterns are assembled at runtime so
+ * the scan cannot match (and corrupt) this module's own string literals. */
+static void relabel_pass(const char *want, const char *repl, int len,
+                         int *n_ascii, int *n_utf16)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *addr = NULL;
+    unsigned short want_w[32], repl_w[32];
+    int i;
+
+    for (i = 0; i < len; i++) {
+        want_w[i] = (unsigned short)(unsigned char)want[i];
+        repl_w[i] = (unsigned short)(unsigned char)repl[i];
     }
-    plog("        owner unidentified (no vtable within 0x4000)");
+
+    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        /* Never write into executable pages: making them PAGE_READWRITE strips
+         * EXECUTE, and the game dies the moment it runs code there. Menu text
+         * lives in data, so skipping code costs nothing. */
+        int writable_heap = mbi.State == MEM_COMMIT &&
+                            mbi.Type == MEM_PRIVATE &&
+                            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                            (mbi.Protect & PAGE_READWRITE) != 0;
+        if (writable_heap && !(g_own_stack &&
+              (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
+              (unsigned char *)g_own_stack < next)) {
+            unsigned char *q = (unsigned char *)mbi.BaseAddress;
+            unsigned char *e2 = next - (len * 2);
+            for (; q <= e2; q++) {
+                DWORD prot, back;
+                if (memcmp(q, want, len) == 0) {
+                    if (VirtualProtect(q, len, PAGE_READWRITE, &prot)) {
+                        memcpy(q, repl, len);
+                        VirtualProtect(q, len, prot, &back);  /* restore */
+                        (*n_ascii)++;
+                    }
+                } else if (memcmp(q, want_w, len * 2) == 0) {
+                    if (VirtualProtect(q, len * 2, PAGE_READWRITE, &prot)) {
+                        memcpy(q, repl_w, len * 2);
+                        VirtualProtect(q, len * 2, prot, &back);
+                        (*n_utf16)++;
+                    }
+                }
+            }
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
 }
 
 static DWORD WINAPI probe_main(LPVOID unused)
 {
-    DWORD lists[MAX_OBJ], refs[MAX_OBJ];
-    int nl, i, j, nrefs;
-    int marker;
-    DWORD menu = 0, quit_btn = 0, credits_btn = 0;
+    DWORD lists[MAX_OBJ];
+    int nl, i, t, marker;
+    int na = 0, nw = 0;
+    char *defname;
+    char want[16], repl[16];
+    DWORD menu = 0, count = 0;
+    DWORD ours = 0, ref = 0;
 
     (void)unused;
     g_own_stack = &marker;
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) return 0;
 
-    plog("=== re-probe attached (referrer/owner map) ===");
-    Sleep(40000);
+    plog("=== re-probe: add \"Crossover\" to the main menu ===");
 
+    /* 1. Point the menu-definition pushes at the 7-entry variant. */
+    defname = (char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!defname) { plog("!! VirtualAlloc failed"); goto done; }
+    strcpy(defname, "UI_FRONTEND_MAIN_MENU");
+    plog("definition -> \"%s\" @ 0x%08lX", defname, (DWORD)(uintptr_t)defname);
+    plog("patch no-continue operand: %s",
+         patch_dword(PUSH_IMM_NO_CONTINUE, (DWORD)(uintptr_t)defname) ? "ok" : "FAILED");
+    plog("patch main operand:        %s",
+         patch_dword(PUSH_IMM_MAIN, (DWORD)(uintptr_t)defname) ? "ok" : "FAILED");
+
+    /* 2. Rewrite the label continuously, so it is in place before the glyphs
+     *    are baked at screen construction. */
+    want[0]='X'; want[1]='b'; want[2]='o'; want[3]='x'; want[4]=' ';
+    want[5]='L'; want[6]='i'; want[7]='v'; want[8]='e'; want[9]=0;
+    repl[0]='C'; repl[1]='r'; repl[2]='o'; repl[3]='s'; repl[4]='s';
+    repl[5]='o'; repl[6]='v'; repl[7]='e'; repl[8]='r'; repl[9]=0;
+
+    /* Relabel continuously so it lands before the glyphs are baked at screen
+     * construction. Restricted to heap memory: the live text buffers are on the
+     * heap, and sweeping the mapped image as well was both slow and crashed the
+     * game. */
+    for (t = 0; t < 50; t++) {
+        relabel_pass(want, repl, 9, &na, &nw);
+        Sleep(250);
+    }
+    plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
+    plog("relabel: %d ascii + %d utf16 replacement(s)", na, nw);
+
+    /* 3. Locate our entry and a normal one, then diff them to find the field
+     *    responsible for the larger text. */
+    /* The menu is not always up at a fixed time, so retry rather than sample
+     * once and give up. */
+    for (t = 0; t < 40 && !(ours && ref); t++) {
     nl = scan_dword(VT_FRONTEND_LIST, lists, MAX_OBJ);
     if (nl > MAX_OBJ) nl = MAX_OBJ;
 
@@ -154,38 +226,76 @@ static DWORD WINAPI probe_main(LPVOID unused)
             DWORD btn = *(DWORD *)(uintptr_t)(b + k * 4);
             const char *nm = button_defname(btn);
             if (!nm) continue;
-            if (strcmp(nm, "UI_FRONTEND_BUTTON_QUIT") == 0) { menu = lists[i]; quit_btn = btn; }
-            if (strcmp(nm, "UI_FRONTEND_BUTTON_CREDITS") == 0) credits_btn = btn;
+            if (strcmp(nm, "UI_FRONTEND_BUTTON_LIVE_AWARE") == 0) {
+                menu = lists[i]; count = n; ours = btn;
+            }
+            if (strcmp(nm, "UI_FRONTEND_BUTTON_CREDITS") == 0) ref = btn;
         }
     }
-    if (!quit_btn) { plog("!! Quit button not found"); goto done; }
-    plog("menu list 0x%08lX  quit=0x%08lX  credits=0x%08lX", menu, quit_btn, credits_btn);
+
+        if (!(ours && ref)) Sleep(2000);
+    }
+
+    if (!ours || !ref) { plog("!! could not locate both buttons"); goto done; }
+    plog("");
+    plog("our entry (LIVE_AWARE) = 0x%08lX", ours);
+    plog("reference (CREDITS)    = 0x%08lX", ref);
+    plog("menu list 0x%08lX, %lu children", menu, count);
+
+    /* The Xbox Live entry renders in a larger font than its neighbours.
+     * +0x00C is 7 on it and 1 on every normal entry -- a style/type id. Match
+     * it so the new entry is typeset like the rest of the menu. */
+    {
+        DWORD *style = (DWORD *)(uintptr_t)(ours + 0x0C);
+        DWORD was = *style;
+        DWORD want_style = *(DWORD *)(uintptr_t)(ref + 0x0C);
+        *style = want_style;
+        plog("");
+        plog("style +0x00C: %lu -> %lu (matching CREDITS)", was, *style);
+    }
+
+    /*
+     * The oversized text is inherited from the Xbox Live definition and is
+     * baked at construction, so it cannot be scaled from here. What CAN be
+     * fixed live is the resulting overlap: push every entry below ours further
+     * down so the taller row has clear space. +0x038 is the render position,
+     * verified by moving a live button on screen.
+     */
+    {
+        float ours_y = *(float *)(uintptr_t)(ours + 0x38);
+        DWORD b2 = *(DWORD *)(uintptr_t)(menu + VEC_BEGIN);
+        DWORD e2 = *(DWORD *)(uintptr_t)(menu + VEC_END);
+        DWORD k;
+        int moved = 0;
+        for (k = 0; k < (e2 - b2) / 4; k++) {
+            DWORD btn = *(DWORD *)(uintptr_t)(b2 + k * 4);
+            float *y;
+            if (IsBadReadPtr((void *)(uintptr_t)(btn + 0x38), 4)) continue;
+            y = (float *)(uintptr_t)(btn + 0x38);
+            if (*y > ours_y) { *y += 14.0f; moved++; }
+        }
+        plog("");
+        plog("overlap fix: our row y=%.1f, pushed %d lower entries down by 14",
+             (double)ours_y, moved);
+    }
 
     plog("");
-    plog("=== ANY pointer landing inside the Quit button (intrusive links) ===");
-    {
-        MEMORY_BASIC_INFORMATION mbi;
-        unsigned char *addr = NULL;
-        DWORD lo = quit_btn, hi = quit_btn + 0x400;
-        int n = 0;
-        while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
-            unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
-            if (region_ok(&mbi)) {
-                unsigned char *q = (unsigned char *)mbi.BaseAddress, *e2 = next - 4;
-                for (; q <= e2; q += 4) {
-                    DWORD v = *(DWORD *)q;
-                    if (v >= lo && v < hi) {
-                        DWORD site = (DWORD)(uintptr_t)q;
-                        if (site >= lo && site < hi) continue;   /* self-links */
-                        if (n++ < 40)
-                            plog("    0x%08lX -> quit+0x%03lX", site, v - quit_btn);
-                    }
-                }
-            }
-            if (next <= addr) break;
-            addr = next;
-        }
-        plog("  total external pointers into the button: %d", n);
+    plog("=== raw dwords differing between the two buttons ===");
+    plog("    (position rows differ legitimately; looking for a style/font id)");
+    for (i = 0; i + 4 <= 0x600; i += 4) {
+        DWORD a, b;
+        float fa, fb;
+        if (IsBadReadPtr((void *)(uintptr_t)(ours + (DWORD)i), 4)) continue;
+        if (IsBadReadPtr((void *)(uintptr_t)(ref + (DWORD)i), 4)) continue;
+        a = *(DWORD *)(uintptr_t)(ours + (DWORD)i);
+        b = *(DWORD *)(uintptr_t)(ref + (DWORD)i);
+        if (a == b) continue;
+        /* skip pointers -- they always differ and tell us nothing */
+        if (a > 0x00400000u && b > 0x00400000u) continue;
+        fa = *(float *)&a;
+        fb = *(float *)&b;
+        plog("    +0x%03X  ours=0x%08lX (%.3f)   credits=0x%08lX (%.3f)",
+             i, a, (double)fa, b, (double)fb);
     }
 
 done:
