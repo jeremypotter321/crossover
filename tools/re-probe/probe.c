@@ -390,6 +390,7 @@ static volatile LONG  g_patched_screens;
 static volatile DWORD g_text_def;      /* a CText definition we reuse   */
 static volatile DWORD g_text_id;       /* its id, for screen child lists */
 static volatile LONG  g_text_injected;
+static volatile LONG  g_hook_hits;
 
 static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
 {
@@ -414,7 +415,7 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
          * screen's child list so the main menu picks it up. */
         if (!IsBadReadPtr((void *)(uintptr_t)(d + 0x5C), 4) &&
             *(DWORD *)(uintptr_t)(d + TYPE_OFF) == 0x06 &&
-            (!g_text_id || *(DWORD *)(uintptr_t)(d + 0x20) < g_text_id)) {
+            0) {   /* id is pinned above; no per-run picking */
             /* Lowest id wins, so the SAME definition is injected every run --
              * "first resolved" varied per launch and kept changing the text. */
             g_text_def = d;
@@ -882,6 +883,82 @@ static void dismiss_dialogs(void)
     PostMessageA(hw, WM_KEYUP,   VK_SPACE, 0);
 }
 
+
+/*
+ * Inline hook on the factory's type dispatch -- deterministic, no racing.
+ *
+ * At 0x0041D249 the definition is resolved (EBX) but the component is not yet
+ * built, which is the only window where a screen's child list can still be
+ * changed. The bytes there are:
+ *
+ *   0041D249  8B 43 3C        mov eax,[ebx+0x3C]
+ *   0041D24C  83 F8 2B        cmp eax,0x2B
+ *
+ * Six bytes, no relative operands, so a 5-byte jmp fits and the originals can
+ * simply be re-executed in the stub. Flags from the cmp must survive, so the
+ * register save/restore happens BEFORE it and we return straight to the ja.
+ */
+#define HOOK_SITE   0x0041D249u
+#define HOOK_RESUME 0x0041D24Fu   /* the `ja` that follows the cmp */
+
+void on_definition(unsigned int def);
+
+void on_definition(unsigned int def)
+{
+    if (!def || IsBadReadPtr((void *)(uintptr_t)(def + TYPE_OFF), 4)) return;
+    if (*(DWORD *)(uintptr_t)(def + TYPE_OFF) != 0x0A) return;      /* screens */
+    if (IsBadReadPtr((void *)(uintptr_t)(def + 0x78), 4)) return;
+    if (!g_text_id) return;
+    {
+        DWORD b = *(DWORD *)(uintptr_t)(def + 0x70);
+        DWORD e = *(DWORD *)(uintptr_t)(def + 0x74);
+        DWORD n, k, *nv;
+        if (b < 0x10000 || e <= b || (e - b) > 0x400) return;
+        n = (e - b) / 4;
+        for (k = 0; k < n; k++)                    /* already extended? */
+            if (*(DWORD *)(uintptr_t)(b + k * 4) == g_text_id) return;
+        nv = (DWORD *)VirtualAlloc(NULL, (n + 2) * 4,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!nv) return;
+        for (k = 0; k < n; k++) nv[k] = *(DWORD *)(uintptr_t)(b + k * 4);
+        nv[n] = g_text_id;
+        *(DWORD *)(uintptr_t)(def + 0x70) = (DWORD)(uintptr_t)nv;
+        *(DWORD *)(uintptr_t)(def + 0x74) = (DWORD)(uintptr_t)(nv + n + 1);
+        *(DWORD *)(uintptr_t)(def + 0x78) = (DWORD)(uintptr_t)(nv + n + 1);
+        g_hook_hits++;
+    }
+}
+
+__attribute__((naked)) static void hook_stub(void)
+{
+    __asm__ __volatile__(
+        "pushal\n\t"
+        "pushfl\n\t"
+        "pushl %ebx\n\t"
+        "call _on_definition\n\t"
+        "addl $4, %esp\n\t"
+        "popfl\n\t"
+        "popal\n\t"
+        "movl 0x3c(%ebx), %eax\n\t"   /* original */
+        "cmpl $0x2b, %eax\n\t"        /* original -- sets flags for the ja */
+        "pushl $0x0041D24F\n\t"
+        "ret\n\t"
+    );
+}
+
+static int install_inline_hook(void)
+{
+    DWORD prot;
+    unsigned char *at = (unsigned char *)(uintptr_t)HOOK_SITE;
+    int rel = (int)((DWORD)(uintptr_t)hook_stub - (HOOK_SITE + 5));
+    if (!VirtualProtect(at, 8, PAGE_EXECUTE_READWRITE, &prot)) return 0;
+    at[0] = 0xE9;                         /* jmp rel32 */
+    *(int *)(at + 1) = rel;
+    at[5] = 0x90;                         /* nop the 6th byte */
+    VirtualProtect(at, 8, prot, &prot);
+    return 1;
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD lists[MAX_OBJ], texts[MAX_OBJ];
@@ -902,6 +979,23 @@ static DWORD WINAPI probe_main(LPVOID unused)
     AddVectoredExceptionHandler(1, wrapper_handler);
     plog("factory breakpoint at 0x%08X: %s", FACTORY_TYPE_READ,
          arm_factory_bp() ? "armed" : "FAILED");
+
+    /* Inject the definition whose string we rewrite. The media-player-error
+     * screen is id 604 and its child list begins at 605, so 605 is that
+     * screen's text -- the one now reading "Hello World". */
+    g_text_id = 605;
+    /* Inline hook is correct in placement (5-byte jmp over a 6-byte,
+     * relocation-free pair, resuming at the `ja`) but the handler calls
+     * VirtualAlloc/IsBadReadPtr from inside the game's dispatch and that
+     * re-entrancy kills it. Needs a pre-allocated buffer and no Win32 calls in
+     * the handler before it can be enabled. */
+#ifdef ENABLE_INLINE_HOOK
+    plog("inline hook at 0x%08X: %s", HOOK_SITE,
+         install_inline_hook() ? "installed" : "FAILED");
+#else
+    (void)install_inline_hook;
+    plog("inline hook: compiled but disabled (unsafe re-entrancy)");
+#endif
 
     /* Re-arm tightly: components are constructed in a burst, and each hit
      * disarms the breakpoint, so a slow cadence samples almost nothing. */
@@ -1038,6 +1132,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
         plog("");
         plog("=== definitions captured from the factory ===");
         plog("  distinct definitions: %ld", g_caught_n);
+        plog("  INLINE HOOK fired on %ld screen definition(s)", g_hook_hits);
         plog("  INJECTED CText def=0x%08lX id=%lu (injected %ld time(s))",
              g_text_def, g_text_id, g_text_injected);
         plog("  screen child lists extended: %ld", g_patched_screens);
