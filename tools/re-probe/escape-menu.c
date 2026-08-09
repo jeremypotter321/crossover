@@ -71,6 +71,10 @@ static DWORD g_screen_id[N_SCREENS];
 static volatile DWORD g_entry_id;      /* def id of the component we append */
 static volatile DWORD g_entry_def;     /* its definition, for the label     */
 static volatile LONG  g_patched, g_hits;
+static volatile DWORD g_last_id;
+#define MAX_SEEN 128
+static volatile DWORD g_seen[MAX_SEEN];
+static volatile LONG  g_seen_n;
 static unsigned char  g_orig_byte;
 static int            g_orig_saved;
 
@@ -153,10 +157,24 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
             *(float *)(uintptr_t)(d + DEF_Y) = 430.0f;
         }
 
-        /* Append to the Escape menu screen's child list. */
+        /*
+         * Patch every screen definition, not just the four named ones.
+         *
+         * The screen ids can only be resolved once the definition manager
+         * exists, which is ~20s into the load -- and by then the Escape menu
+         * has already been constructed. It is built once, not per-open: the
+         * first version of this armed after the id lookup and saw hits=1,
+         * patched=0 while the menu was sitting open on screen. So the arm has
+         * to happen at DllMain, before any name can be resolved, which means
+         * the handler cannot filter by id. ui-probe.c patched 7-10 screens a
+         * run this way with the game staying up.
+         */
         if (g_entry_id && (type == TYPE_SCREEN_A || type == TYPE_SCREEN_B)) {
-            for (i = 0; i < N_SCREENS; i++) {
-                if (!g_screen_id[i] || g_screen_id[i] != id) continue;
+            int seen = 0;
+            for (i = 0; i < g_seen_n && i < MAX_SEEN; i++)
+                if (g_seen[i] == d) { seen = 1; break; }
+            if (!seen) {
+                if (g_seen_n < MAX_SEEN) g_seen[g_seen_n++] = d;
                 {
                     DWORD b = *(DWORD *)(uintptr_t)(d + DEF_KIDS);
                     DWORD e = *(DWORD *)(uintptr_t)(d + DEF_KIDS + 4);
@@ -173,10 +191,10 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
                             *(DWORD *)(uintptr_t)(d + DEF_KIDS + 4) = (DWORD)(uintptr_t)(nv + n + 1);
                             *(DWORD *)(uintptr_t)(d + DEF_KIDS + 8) = (DWORD)(uintptr_t)(nv + n + 1);
                             g_patched++;
+                            g_last_id = id;
                         }
                     }
                 }
-                break;
             }
         }
     }
@@ -203,6 +221,20 @@ static int arm(void)
     return 1;
 }
 
+/* Re-arm tightly: components are built in a burst, and a slow cadence misses
+ * nearly all of them (Sleep(1) caught 24 definitions where 400ms caught 2). */
+static DWORD WINAPI rearm_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        if (g_orig_saved &&
+            *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ != 0xCC)
+            *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ = 0xCC;
+        Sleep(1);
+    }
+    return 0;   /* not reached; keeps the compiler quiet */
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD gsi = 0, defmgr = 0;
@@ -212,6 +244,18 @@ static DWORD WINAPI probe_main(LPVOID unused)
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) return 0;
     plog("=== escape-menu: add \"%s\" to the in-game menu ===", LABEL);
+
+    /* Arm FIRST. Screens are constructed during the load, long before the
+     * definition manager can be asked for an id. */
+    if (!AddVectoredExceptionHandler(1, bp_handler)) {
+        plog("AddVectoredExceptionHandler failed");
+        goto done;
+    }
+    if (!arm()) { plog("could not arm 0x%08X", FACTORY_TYPE_READ); goto done; }
+    plog("armed at 0x%08X (original byte 0x%02X) at t=0",
+         FACTORY_TYPE_READ, g_orig_byte);
+
+    CreateThread(NULL, 0, rearm_thread, NULL, 0, NULL);
 
     for (t = 0; t < 600 && !defmgr; t++) {
         gsi = rd(GSI_PTR);
@@ -226,24 +270,12 @@ static DWORD WINAPI probe_main(LPVOID unused)
         plog("  %-26s -> id %ld", g_screen_names[i], (long)g_screen_id[i]);
     }
 
-    if (!AddVectoredExceptionHandler(1, bp_handler)) {
-        plog("AddVectoredExceptionHandler failed");
-        goto done;
-    }
-    if (!arm()) { plog("could not arm 0x%08X", FACTORY_TYPE_READ); goto done; }
-    plog("armed at 0x%08X (original byte 0x%02X)", FACTORY_TYPE_READ, g_orig_byte);
     plog("open the Escape menu now");
-
-    /* Re-arm tightly: components are built in a burst, and a slow cadence
-     * misses most of them. Also keep the label rewritten, because the text is
-     * baked to glyphs at construction. */
-    for (t = 0; t < 120000; t++) {
-        if (*(unsigned char *)(uintptr_t)FACTORY_TYPE_READ != 0xCC && g_orig_saved)
-            *(unsigned char *)(uintptr_t)FACTORY_TYPE_READ = 0xCC;
-        if (t % 2000 == 0)
-            plog("  t=%lds  hits=%ld  screens patched=%ld  entry id=%ld",
-                 (long)(t / 200), (long)g_hits, (long)g_patched, (long)g_entry_id);
-        Sleep(5);
+    for (t = 0; t < 600; t++) {
+        plog("  t=%lds  hits=%ld  screens patched=%ld  entry id=%ld  last screen id=%ld",
+             (long)(t * 5), (long)g_hits, (long)g_patched,
+             (long)g_entry_id, (long)g_last_id);
+        Sleep(5000);
     }
 
 done:
