@@ -248,6 +248,59 @@ running; it just does not say what was hoped.
 
 Everything above `Route A — CLOSED` stands as measured; it is simply no longer the way in.
 
+### Can the console be made *visible*? No — the UI is stubbed out. TESTED.
+
+A separate question from the vocabulary one, and worth its own answer because the setup
+looks so promising right up to the last step.
+
+Retail still contains a matched pair of orphaned functions:
+
+| Address | What it does |
+| --- | --- |
+| `0x006344C0` | **`OpenConsole`** — sets `CConsole+0x78 = 1`, then engages the input processor in manager slot `+0x1F8` via its vtable `+0x04` |
+| `0x00634510` | **`CloseConsole`** — clears `CConsole+0x78`, disengages the processor (`0x00A0D2D0`) |
+
+Both are `thiscall` on the input-processor manager. **Neither has a single caller** — the key
+handler that opened the console was compiled out. `CConsole+0x78` is the "console is open"
+flag, and three separate places read it, including the frame loop:
+
+```asm
+0x00435C13  mov  ecx, [0x13CAA40]     ; the CConsole singleton
+0x00435C19  mov  al,  [ecx+0x78]      ; open flag
+0x00435C1E  je   0x00435C5A           ; always taken in retail
+0x00435C55  call 0x009EA550           ; the console's draw
+```
+
+So showing it looks like a one-byte write, with no call into game code. **It is not.**
+
+```
+0x009EA550   console draw, called by the frame loop      ret 4
+0x009EA540   queried when the console is closed          xor al, al ; ret 4
+0x009EA530   input hook at 0x00687FBB                    xor al, al ; ret 4
+```
+
+**All three are empty stubs.** For contrast, every execution-side entry point is real code:
+`RunScript` `0x009EC890`, `AddCommand` `0x009EC5E0`, the ctor `0x009ECD80`, and every command
+handler. `CConsole`'s vtable at `0x0129C600` has exactly one slot — the class barely has
+virtuals left.
+
+Retail kept the console's **object model, command table, open flag, call sites and
+open/close functions**, and threw away the **renderer and the interactive input handler**.
+That is the standard way a dev feature gets compiled out: keep the ABI, empty the bodies.
+
+**Measured live:** `CConsole+0x78` was set to `1` in-game (Bowerstone, escape menu open).
+Nothing drew, and the game stayed up — the frame loop dutifully called a function that
+returns immediately. The flag was then cleared, because `0x006880F7` reads the same byte and
+**skips a branch of normal input handling when it is set**, so leaving it on risks
+swallowing input for no benefit. `tools/re-probe/console-show.c` does both directions
+(`-DCONSOLE_OPEN=0` to clear).
+
+**So there is nothing to switch on.** A visible console would have to be *written* — a
+renderer and a text-input widget — and then pointed at the command table, which is real and
+reachable. That is building a console, not enabling one. What is free today is the execution
+half: `user.ini` runs commands at startup, and `RunScript` (`0x009EC890`) is live code that
+would run a command file mid-session from one call on the game thread.
+
 ## Route B — the compiled definition files
 
 `data/CompiledDefs/{game,frontend,script}.bin` are the actual source of truth for every UI
