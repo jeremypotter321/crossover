@@ -236,6 +236,15 @@ running; it just does not say what was hoped.
 - One entry exists only at run time: **`ConsoleAlpha`**, a variable whose storage is
   `CConsole+0x7C` (the `0xFF` seen in the earlier field map). Registered by code, not by the
   static idiom — the only thing the static pass could not have found.
+- Probing at **t=4s during startup**, before the boot entries are freed, catches the
+  registry at its peak: **40 live entries, every name and payload address identical to the
+  static table** — including all 22 variables' storage addresses and the three boot-only
+  commands. The two absent are the `CGameTimeManager` pair, registered later. The static
+  recovery is complete in both directions.
+- `CConsoleVariable+0x08` is a type code, readable from those live objects: **`1` = int,
+  `3` = float, `4` = bool byte**. It is stored from a register, so the static scan cannot
+  see it; `LandscapePhysicalMemoryRatio` reading `0xBF800000` (= `-1.0f`) with type `3`
+  confirms the mapping.
 
 Everything above `Route A — CLOSED` stands as measured; it is simply no longer the way in.
 
@@ -259,9 +268,9 @@ The lever that makes this tractable: dump a definition **live** from memory (alr
 possible), then find that same record in the file by its distinctive field values. That
 converts format reversing from cold analysis into a matching exercise.
 
-### The engine still contains the def *writer* — and two ini lines reach it
+### The def *writer* is still in the exe — but it is dead code. TESTED.
 
-This came out of Route A and is the most valuable thing it produced.
+This came out of Route A. The static case looked strong; it does not survive contact.
 
 The definition loader branches on the runtime copy of `UseCompiledDefs` at `0x009B08E2`:
 
@@ -288,19 +297,50 @@ the `AllowDataGeneration` console variable:
 registered console variables that `userst.ini` already sets — currently `TRUE` and `FALSE`.
 Flipping them is a two-line text edit, no injection at all.
 
-If the write path does what its shape says, **the retail build can serialise the compiled
-def format itself**, which is far better than reversing the reader: modify definitions in
-memory (already proven possible) and have the engine emit a persistent `.bin`.
+If the write path did what its shape says, the retail build could serialise the compiled def
+format itself — far better than reversing the reader.
 
-Not yet observed — this is read from the disassembly, not run. The obvious risk is that with
-`UseCompiledDefs FALSE` the engine first has to *load* defs from the uncompiled source,
-which retail almost certainly does not ship, so the run may fail before it ever writes. That
-is exactly what the experiment is for, and it is cheap and fully reversible.
+**Run 2026-08-09. It does not. `AllowDataGeneration TRUE` crashes retail at startup.**
 
-**The experiment:** back up `userst.ini`, set `UseCompiledDefs FALSE;` and
-`AllowDataGeneration TRUE;`, launch, and watch whether anything under `data/CompiledDefs/`
-is opened for write or rewritten. It needs a relaunch, so it was not run in the session that
-found it.
+| Run | `UseCompiledDefs` | `AllowDataGeneration` | Result |
+| --- | --- | --- | --- |
+| 1 | `FALSE` | `TRUE` | page fault reading `0x00000010` at **`0x009FC036`** |
+| 2 | `TRUE` | `TRUE` | page fault reading `0x00000010` at **`0x009FC036`** — same address |
+| 3 | `TRUE` | `FALSE` (stock) | boots normally |
+
+The flags did take effect — a probe injected at launch read `0x0138E188`, `0x0138E189` and
+`0x0138DD3B` all `1`, and `0x013CA7D8` (runtime `UseCompiledDefs`) `0` in run 1 and `1` in
+run 2. So this is not a misapplied setting; the code behind the flag genuinely faults.
+
+**Run 2 is the one that matters.** It kept `UseCompiledDefs TRUE`, so the def loader took
+its normal compiled-read path, and it still died at the identical address. The crash is
+caused by `AllowDataGeneration`, not by the uncompiled def path — which also means run 1
+never got far enough to say anything about the def branch at all.
+
+`0x009FC020` is a small intrusive-list unlink helper — zero `[node+8]`, splice out via
+`+0x0C`/`+0x10`, decrement a count at `[owner+0x20]` and subtract a size from `[owner+0x24]`:
+
+```asm
+0x009FC020  mov  eax, [esp+4]         ; the node
+0x009FC024  mov  edx, [eax+0x10]      ; next
+0x009FC02A  mov  dword ptr [eax+8], 0
+0x009FC031  je   0x009FC05A           ; next == NULL is handled
+0x009FC033  mov  esi, [eax+0x0C]      ; prev -- NOT checked
+0x009FC036  cmp  dword ptr [esi+0x10], eax   ; <- faults, prev == NULL
+```
+
+It guards `next` and not `prev`, so it faults the first time data generation asks it to
+evict from an empty pool. Dev-only bookkeeping that no retail run ever exercises.
+
+**Nothing was written.** All 393 files under `data/` hash identically before and after all
+three launches; `CompiledDefs/*.bin` kept their original mtimes. `userst.ini` was restored
+byte-for-byte and the game is verified booting normally again.
+
+So the two-line shortcut is closed. It could in principle be forced — the fault is a single
+unguarded `prev`, and patching `0x009FC033` to skip when `[eax+0x0C]` is NULL would get
+past it — but that is patching retail code to drive a dev path with unknown further
+dependencies, and it is speculation until someone tries it. Not recommended ahead of the
+matching plan below.
 
 ## Recommendation
 
@@ -309,10 +349,12 @@ its script input) and its entire 42-entry vocabulary reaches levels, quests, tim
 bindings and the boot data pipeline, but never the UI. Do not spend more time on activating
 the input processor; it buys a prompt for commands that do not exist.
 
-**Route B is now the only route, and it starts with the writer, not the reader.** Run the
-`userst.ini` experiment above before touching the container format. If the engine will emit
-a `.bin`, the format never has to be reversed at all; if it will not, fall back to the
-live-dump-and-match plan, which is still the tractable version of cold analysis.
+**Route B is now the only route, and the writer shortcut has been tried and failed.** The
+engine's own def serialiser is unreachable — `AllowDataGeneration TRUE` faults at startup in
+retail (measured, twice, above). So Route B is the live-dump-and-match plan: dump a
+definition from memory, find that record in `game.bin` by its distinctive field values, and
+grow the format outwards from the matches. That is still the tractable version of cold
+analysis, and it is now the only version.
 
 Do not extend the runtime-attachment work further. Its reach has been measured and the
 Escape menu is outside it.

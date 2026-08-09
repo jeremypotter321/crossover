@@ -92,7 +92,14 @@ vocabulary is 20 commands + 22 variables and none of them touch the UI.
 | `0x0138E188` | def-file **write** gate, copied from `AllowDataGeneration` at `0x004025DA` |
 
 `tools/re-static/console-cmds.py` prints the whole table (name, class, handler or storage
-address) from the exe. `tools/re-probe/console-vocab.c` checks it against the running game.
+address) from the exe. `tools/re-probe/console-vocab.c` checks it against the running game
+(inject at launch with `make SRC=console-vocab.c run` to catch the boot-only entries; by
+the frontend only 18 of the 42 are still registered).
+
+> **`AllowDataGeneration TRUE` crashes retail at startup** — page fault reading `0x10` at
+> `0x009FC036`, an unlink helper that guards `next` but not `prev`. Measured twice, with
+> `UseCompiledDefs` both TRUE and FALSE. The engine's compiled-def *writer* is behind that
+> flag, so it is unreachable. Do not spend another launch on it; see `ui-control-plan.md`.
 
 > Commands in the ini files that do nothing — `SetPlayIntro`, `SetResolution`,
 > `ShowDevFrontEnd`, `AllowDebugProfile`, `MaxThingDrawDist` and friends — **are not in the
