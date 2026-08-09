@@ -171,6 +171,59 @@ of the give.
 
 ---
 
+## 4a. The menu gate — what has been ruled out
+
+`GAME_ACTION_OPEN_IN_GAME_MENU` is **action 3** (index into `EGameAction` in
+`Core/SDK/Fable/GameAction.h`). `0x00687CF0` is the "was this action pressed" query —
+identified because `0x0068E534` calls it with `0x4E`, which is `GAME_ACTION_CHARGE_GUILD_SEAL`.
+It has 351 call sites covering nearly the whole action enum.
+
+Seven sites query action 3. The two that open the menu, `0x00690B20` and `0x00691721`, are
+near-identical and gate the press like this (`ebp` is the hero, from
+`0x00487DC0([handler+0x18])`):
+
+```asm
+call 0x00687CF0                 ; action 3 pressed?
+test al, al
+je   <ignore>
+test byte ptr [ebp+0x38], 0x40  ; hero flag
+je   <ignore>                   ; press silently dropped
+```
+
+Measured live on the tutorial hero, **both conditions are already satisfied**:
+
+```
+hero 0x08870E18  +0x38=0x40 (menu bit SET)  +0x34=50C20481 (bit 0x20000 set)
+```
+
+So the following are eliminated as the cause:
+
+| Ruled out | Evidence |
+| --- | --- |
+| The hero not having the seal | slot `0x11` holds def 4305, count 1, **before** any give |
+| The hero not owning slot `0x11` | `0x00410DE0(hero+0x20, 0x11)` returns true |
+| `hero+0x38 & 0x40` (the menu gate) | already `0x40` |
+| `hero+0x34 & 0x20000` (the other branch) | already set |
+| The HUD being off | HUD is drawn — see the Oakvale screenshot; `vtable+0x594(1)` also called |
+
+What is left, in order of likelihood:
+
+1. **The press never becomes action 3.** The tutorial may run a control mode whose input
+   map has no binding for it. Note `user.ini` does `RunScript("joystick.ini")` and no
+   `joystick.ini` exists in the install.
+2. **`0x00687A90(handler, arg)`** — the precondition at the very top of `0x00690B20`, before
+   the hero is even fetched. If it returns false the whole handler bails.
+3. A different handler is live: `0x00688395`, `0x0068A4EE`, `0x00690C93`, `0x00691A3D` also
+   query action 3.
+
+**The next experiment** is to determine whether the handler is reached at all: arm an INT3
+at `0x00690BF5` (the `test byte ptr [ebp+0x38], 0x40`, which is reached only once action 3
+has actually fired) with `AddVectoredExceptionHandler` — guard pages do not fire under
+Wine, INT3 does — and press the button. If it never trips, the problem is upstream in input
+mapping and nothing about the seal or the hero flags matters.
+
+---
+
 ## 5. Names and ids
 
 `data/CompiledDefs/names.bin` (see `ui-system.md` for its format) carries the seal family:

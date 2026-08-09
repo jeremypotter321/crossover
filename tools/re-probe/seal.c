@@ -30,7 +30,10 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#define LOG_PATH "probe.log"
+/* Absolute: when the probe is attached to an already-running game rather than
+ * injected at startup, the process working directory is not the game folder,
+ * and a relative fopen silently produced no log at all. */
+#define LOG_PATH "C:\\Games\\Fable\\seal.log"
 
 /* --- verified absolute addresses (Fable.exe, ImageBase 0x400000, no ASLR) --- */
 #define GSI_PTR        0x0143E8F8u  /* CGameScriptInterface *                  */
@@ -49,6 +52,20 @@
 
 #define SEAL_NAME "OBJECT_GUILD_SEAL_1"
 #define SEAL_SLOT 0x11              /* the slot the HUD checks for the seal     */
+
+/*
+ * GAME_ACTION_OPEN_IN_GAME_MENU is action 3, and 0x00687CF0 is the "was this
+ * action pressed" query. Both handlers that answer action 3 -- 0x00690B20 and
+ * 0x00691721 -- drop the press unless one bit is set on the hero:
+ *
+ *     test byte ptr [hero+0x38], 0x40
+ *     je   <ignore the press>
+ *
+ * so with the bit clear the button does nothing at all, however much of the
+ * seal the hero is carrying.
+ */
+#define HERO_MENU_FLAG_OFF  0x38u
+#define HERO_MENU_FLAG_BIT  0x40u
 
 static FILE *g_log;
 
@@ -261,6 +278,50 @@ static int give_seal(DWORD gsi, DWORD hero)
     return 1;
 }
 
+/*
+ * Hold the in-game-menu bit set. It is done in a loop rather than once because
+ * the tutorial may well clear it again every frame -- and if it does, the log
+ * says so instead of leaving us guessing why one write "did not take".
+ * The hero is re-resolved each pass so a level transition does not leave this
+ * writing to a freed object.
+ */
+static void hold_menu_flag(DWORD gsi)
+{
+    DWORD last = 0xFFFFFFFF, cleared = 0;
+    int i;
+
+    plog("");
+    plog("holding hero+0x%X bit 0x%02X set (the in-game menu gate)",
+         HERO_MENU_FLAG_OFF, HERO_MENU_FLAG_BIT);
+
+    for (i = 0; i < 7200; i++) {          /* ~30 min at 250 ms */
+        DWORD hero = find_hero(gsi);
+        unsigned char *p, v;
+
+        if (!hero) { Sleep(250); continue; }
+        p = (unsigned char *)(uintptr_t)(hero + HERO_MENU_FLAG_OFF);
+        if (!readable(hero + HERO_MENU_FLAG_OFF)) { Sleep(250); continue; }
+
+        v = *p;
+        if (v != last) {
+            DWORD f34 = rd(hero + 0x34);
+            plog("  t=%ds  hero 0x%08lX  +0x38=0x%02X (menu bit %s)  "
+                 "+0x34=%08lX (bit 0x20000 %s)  +0x30=%08lX +0x3C=%08lX",
+                 i / 4, hero, v, (v & HERO_MENU_FLAG_BIT) ? "SET" : "clear",
+                 f34, (f34 & 0x20000) ? "set" : "CLEAR",
+                 rd(hero + 0x30), rd(hero + 0x3C));
+            last = v;
+        }
+        if (!(v & HERO_MENU_FLAG_BIT)) {
+            *p = (unsigned char)(v | HERO_MENU_FLAG_BIT);
+            cleared++;
+            last = *p;
+        }
+        Sleep(250);
+    }
+    plog("  the game cleared the bit %lu time(s) while we held it", cleared);
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     int t, announced = 0;
@@ -303,6 +364,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
             plog("=== seal given ===");
         else
             plog("=== give did not run ===");
+        hold_menu_flag(gsi);
         fclose(g_log);
         g_log = NULL;
         return 0;

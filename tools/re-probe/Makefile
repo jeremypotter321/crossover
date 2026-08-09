@@ -17,7 +17,7 @@ WHISKY  := /Applications/Whisky.app/Contents/Resources/WhiskyCmd
 
 SRC ?= probe.c
 
-all: probe.dll inject.exe
+all: probe.dll inject.exe attach.exe
 
 probe.dll: $(SRC)
 	$(CC) $(CFLAGS) -shared -o $@ $< -Wl,--enable-stdcall-fixup
@@ -25,13 +25,25 @@ probe.dll: $(SRC)
 inject.exe: inject.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+attach.exe: attach.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 # Copy both into the game directory and run the injector there. The probe writes
 # probe.log relative to the process working directory, which is the game dir.
 install: all
-	cp probe.dll inject.exe "$(GAME)/"
+	cp probe.dll inject.exe attach.exe "$(GAME)/"
 
 run: install
 	cd "$(GAME)" && eval "$$($(WHISKY) shellenv Fable)" && wine64 inject.exe Fable.exe probe.dll
+
+# Attach to the game that is already running, so an iteration does not cost a
+# relaunch (and, with no save games, a replay of the intro). LoadLibrary
+# ignores a DLL that is already mapped, so each attach gets a fresh filename.
+ATTACH_N ?= $(shell date +%H%M%S)
+attach: all
+	cp probe.dll "$(GAME)/probe-$(ATTACH_N).dll"
+	cp attach.exe "$(GAME)/"
+	cd "$(GAME)" && eval "$$($(WHISKY) shellenv Fable)" && wine64 attach.exe probe-$(ATTACH_N).dll
 
 log:
 	@cat "$(GAME)/probe.log" 2>/dev/null || echo "no probe.log yet"
