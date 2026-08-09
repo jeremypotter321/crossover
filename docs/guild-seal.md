@@ -224,6 +224,57 @@ mapping and nothing about the seal or the hero flags matters.
 
 ---
 
+## 4b. Using the seal: it is a 2-second hold, not a press
+
+Using the seal from the quick-access ring is handled by
+**`CInputProcessQuickAccessItems`** (vtable `0x01237AE0`, constructed at `0x00486860`);
+the handler is vtable slot `+0x10` → `0x0068E510`. Its base ctor `0x00687A30` copies four
+pointers from a context struct into `+0x14..+0x20`, so `[esi+0x14]` is `ctx[0]` — an object
+carrying the definition manager at `+0x10`, the script interface's own shape. That is why
+its `+0xD5` byte reads `0x37` and the gate there passes.
+
+The handler runs to completion. Traced statically end to end:
+
+```asm
+call 0x005BDF08          ; carrying the seal?           -> yes, count 1
+test eax,eax / jle bail
+mov  cl,[eax+0xD5]       ; seal enabled?                -> 0x37, passes
+test cl,cl / je bail
+jmp  0x0068E7B8
+0x0068E7B8:
+fld  dword [esp+0x14]    ; charge duration = 0x40000000 = 2.0f (seal-specific)
+fcomp dword [0x0129BA3C] ; = 1e-4
+fnstsw ax / test ah,0x41
+jne  0x0068E84B          ; NOT taken: 2.0 > 1e-4
+<falls through>          ; dispatches event 0x29 -- "begin charging"
+```
+
+The alternate branch at `0x0068E84B` builds event `0x27` instead: that is the instant-use
+path for items whose charge time is ~0. **The seal deliberately takes the other one.**
+
+The charge itself is `CDrawGuildSeal::SetCharging` at `0x0064D92A`:
+
+| Field | Meaning |
+| --- | --- |
+| `+0x28` | the charge-up sound handle (`GUILD_SEAL_CHARGEUP`, played from container slot `0x10`) |
+| `+0x2C` | the id being charged, `-1` when idle |
+| `+0x30` | the charge timer, zeroed on start |
+| `+0x34` | charging flag |
+
+Its second argument is a bool; `cmp byte [ebp+0xC], 0 / je 0x0064DA46` aborts the charge and
+sets `+0x2C = -1`, `+0x34 = 0`. So a *release* stops it.
+
+**Consequence: the seal only opens the menu after a ~2 second hold.** A tap dispatches
+"begin charging" and then immediately aborts, which looks exactly like "I can use it but
+nothing happens". Worth ruling out before any more reverse engineering.
+
+`SetCharging` has no direct callers and is not in `CDrawGuildSeal`'s vtable (`0x0125A6BC`,
+only two entries), so it is reached through the event dispatch — `0x009F1760` builds the
+message, `0x00A0D340` sends it. Tracing event `0x29` from there to `SetCharging` is the
+remaining unknown.
+
+---
+
 ## 5. Names and ids
 
 `data/CompiledDefs/names.bin` (see `ui-system.md` for its format) carries the seal family:
