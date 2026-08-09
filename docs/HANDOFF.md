@@ -75,6 +75,30 @@ definition ids**.
 **Components:** `+0x20` → CharString → definition name · **`+0x038` render Y (30 per menu
 row, live-editable, proven)**. Horizontal position field is **unknown** — `+0x034` disproved.
 
+### Dev console (route A — closed, see `docs/ui-control-plan.md`)
+
+The console is compiled into retail, live, and **already scriptable**: `user.ini` and
+`userst.ini` are console scripts the game feeds to `RunScript` at startup. Its full
+vocabulary is 20 commands + 22 variables and none of them touch the UI.
+
+| Address | What |
+| --- | --- |
+| `0x013CAA40` | **`CConsole*` singleton** (live-verified `0x02C9DF68`) |
+| `0x00414C90` | `GetConsole()`; ctor `0x009ECD80`, installer `0x00413520` |
+| `0x009EC890` | **`CConsole::RunScript(CharString *filename)`** |
+| `0x00414C7F` / `0x00418981` | run `userst.ini` (gated on byte `0x01375444`) / `user.ini` |
+| `0x009EC5E0` | `CConsole::AddCommand(CConsoleInputBase*)` |
+| `0x013B8617` / `0x01375459` | `UseCompiledDefs` / `AllowDataGeneration` variable storage |
+| `0x0138E188` | def-file **write** gate, copied from `AllowDataGeneration` at `0x004025DA` |
+
+`tools/re-static/console-cmds.py` prints the whole table (name, class, handler or storage
+address) from the exe. `tools/re-probe/console-vocab.c` checks it against the running game.
+
+> Commands in the ini files that do nothing — `SetPlayIntro`, `SetResolution`,
+> `ShowDevFrontEnd`, `AllowDebugProfile`, `MaxThingDrawDist` and friends — **are not in the
+> exe at all**, in any encoding. Retail kept the interpreter and compiled out the vocabulary.
+> That answers the §7 question about `SetPlayIntro(false)`: there is nothing to fix.
+
 ### Guild seal (current task) — see `docs/guild-seal.md`
 
 > **`0x0058EEEC` in the previous revision of this file was wrong.** It is a `jmp` inside an
@@ -150,7 +174,8 @@ row, live-editable, proven)**. Horizontal position field is **unknown** — `+0x
 - **Wine video dialog (`0x80040218`)** intermittently blocks the menu. `wineserver -k`
   sometimes clears it. `osascript` cannot click it (no accessibility permission), and
   `PostMessage` of Return/Space does not dismiss it (the game reads DirectInput).
-  `userst.ini` already has `SetPlayIntro(false)` — worth investigating why it still plays.
+  `userst.ini`'s `SetPlayIntro(false)` will never help — the command is not in the retail
+  exe (see the dev-console section above). Suppress the intro some other way.
 - **`gh` token lacks `workflow` and `delete_repo` scopes.** So the CI workflow cannot be
   pushed (it is parked on the local branch `ci/windows-build`) and the retired fork cannot be
   deleted. Fix: `gh auth refresh -h github.com -s workflow -s delete_repo` **run in a real

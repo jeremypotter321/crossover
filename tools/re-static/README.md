@@ -18,6 +18,8 @@ python3 -m venv re-venv
 | `re2.py callers <hex>` | every direct `call rel32` targeting an address |
 | `strfind.py <substr>...` | NUL-terminated strings containing a substring, with their xrefs |
 | `cmds.py <lo> <hi> [filter]` | every `push imm32` in a range where the immediate is a string — this is how the script-command vocabulary was recovered |
+| `rtti.py name/vt/slots` | MSVC RTTI: class name ↔ vtable, and vtable slot dumps |
+| `console-cmds.py [substr]` | the whole dev-console table — 20 commands with their handler addresses, 22 variables with their storage addresses |
 
 `re2.py func` is the one to trust. `re_tool.py func` guesses prologues and will happily
 start mid-function; both were wrong about `0x0058EEEC` in an earlier pass, which is what

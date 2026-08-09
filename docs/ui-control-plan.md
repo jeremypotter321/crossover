@@ -160,26 +160,84 @@ quick-access instances are zeroed exactly like all four console ones. So the fie
 *the currently engaged processor of the active manager* rather than a permanent registration.
 Both readings lead to the same next move.
 
-**Next, in order:**
+Those were the next steps while activation still looked like the way in. It is not — see
+below. Activating the input processor was never needed, because the console already runs
+scripts, and the vocabulary it would have exposed turns out not to reach the UI.
 
-1. Find who writes `CAInputProcess+0x04`. A scan for self-referencing list-head inits
-   (`mov [reg+8], reg`) near the input code found only `0x0048A1DD` and `0x0048AEC0`, and
-   neither is the processor -- `0x0048A1B0` initialises a different object with a 0x20-byte
-   node at `+0x10`. So search instead for writes to `+0x04` on an object whose vtable is
-   `0x0129CA10`, or breakpoint the write live.
-2. Cheaper and possibly decisive: watch manager `0x0837FA08` slots `+0x160` (quick-access)
-   and `+0x1F8` (console) **while opening and closing the Escape menu**. Whatever the engine
-   does to engage a processor will show up as a field change, read-only, no patching.
-3. Only then attempt the write -- and on the game thread via the factory breakpoint
-   (INT3 + vectored handler matching **ExceptionAddress**), never off-thread.
+## Route A — CLOSED. The console is already open, and it cannot drive the UI
 
-Do (2) first. It is free, it cannot crash the session, and it shows the mechanism in action
-rather than inferring it.
+Two findings, one static and one measured, close this route.
 
-Old next step: the console is fully built, so the remaining question is **activation** — what makes
-the manager route input to slot `+0x1F8`. Look for a "current processor" pointer or an
-enabled flag on the manager that owns the slot, and compare it against the quick-access
-processor, which is demonstrably active. Then walk `CConsole+0x40` for the command list.
+### The console's input surface is `user.ini` / `userst.ini`
+
+`0x009EC890` is `CConsole::RunScript(filename)`, and the game hands it both ini files
+during startup:
+
+| Address | What |
+| --- | --- |
+| `0x013CAA40` | **the `CConsole*` singleton** (ctor `0x009ECD80`, installed by `0x00413520`) |
+| `0x00414C90` | `GetConsole()` — returns the singleton, constructing it on first use |
+| `0x009EC890` | `CConsole::RunScript(CharString *filename)` |
+| `0x00414C7F` | runs **`userst.ini`**, gated on the byte at `0x01375444` |
+| `0x00418981` | runs **`user.ini`** |
+| `0x009EC5E0` | `CConsole::AddCommand(CConsoleInputBase*)` |
+
+So every line of those files is a console statement. That is why `user.ini` contains
+`RunScript("joystick.ini");` and `ActivateQuest("Gameflow");` — both are real registered
+commands. **No activation, no injection and no input processor is required to issue a
+console command: put it in the ini.** Slot `+0x1F8` only ever mattered for typing at a
+prompt.
+
+It also explains a long-standing puzzle from `HANDOFF.md` §7. `SetPlayIntro(false)` is in
+`userst.ini` and does nothing because **`SetPlayIntro` does not exist in the retail exe** —
+neither do `SetResolution`, `ShowDevFrontEnd`, `AllowDebugProfile`, `SetSkipFrontend`,
+`UseLevelWAD`, `PresentImmediate`, `SetDefinitionValidation`, `SetRunScripts`,
+`SetMaxAnisotropy`, `MaxThingDrawDist` or any of the rest. Those names appear nowhere in
+`Fable.exe` as ASCII or UTF-16. The ini files are Lionhead's dev-era scripts shipped intact;
+retail kept the interpreter and compiled out most of the vocabulary, and unknown statements
+are ignored silently. Chasing `ShowDevFrontEnd FALSE` any further is chasing a name with no
+code behind it.
+
+### The whole vocabulary, and why it is not enough
+
+`tools/re-static/console-cmds.py` recovers the table straight out of `.text`. Every entry is
+built by the same idiom — allocate, construct a `CharString` name, store the vtable, store
+the payload, `AddCommand` — so name, class and payload are all immediates:
+
+| Class | vtable | size | layout |
+| --- | --- | --- | --- |
+| `CConsoleClasslessCommand` | `0x0122E65C` | `0x18` | `+0x04` name · `+0x14` handler |
+| `CConsoleCommand<T>` | `0x0129C4E0`, `0x0125D668` | `0x1C` | `+0x04` name · `+0x14` owner · `+0x18` handler |
+| `CConsoleVariable` | `0x0122E5C8` | `0x10` | `+0x04` name · `+0x08` type · `+0x0C` **storage address** |
+
+That is **20 commands and 22 variables**. The commands are `ActivateQuest`, `SetLevel`,
+`SetStartingHolySite`, `EnableCodeSectionLoading`, `SetTimeOfDay`, `SetDaySpeed`,
+`BindKey`, `BindString`, `RunBoundString`, `RunScript`, `CommandList`, `VarList`, the two
+`*Containing` search commands, `ConsoleListContaining` and five console-colour setters. The
+variables are all boot-time data-pipeline switches (`UseCompiledDefs`, `RunFromDVD`,
+`AllowDataGeneration`, the pool sizes).
+
+**Not one of them touches the UI.** The premise this route was run on — that `CommandList`
+would hand over most of what is wanted — is measurably false. `CommandList` was worth
+running; it just does not say what was hoped.
+
+### Measured live, read-only (`tools/re-probe/console-vocab.c`)
+
+- The singleton at `0x013CAA40` holds `0x02C9DF68` with the correct vtable, confirming the
+  global. No scanning needed any more.
+- **All nine variables `userst.ini` sets match their live bytes**, and the `userst.ini`
+  gate at `0x01375444` is `1`. The ini really is executed.
+- `CConsole+0x44` counts **18**, and a vtable scan finds exactly those 18 — every name and
+  every handler address identical to the static table. The static recovery is complete.
+- The 18 are the 14 `Command<CConsole>` + 2 `Command<CGameTimeManager>` + `ActivateQuest` +
+  one variable. So the boot-config entries (`SetLevel`, `SetStartingHolySite`,
+  `EnableCodeSectionLoading` and all 22 variables) are registered, executed from the ini,
+  and then **freed** — one-shot boot configuration.
+- One entry exists only at run time: **`ConsoleAlpha`**, a variable whose storage is
+  `CConsole+0x7C` (the `0xFF` seen in the earlier field map). Registered by code, not by the
+  static idiom — the only thing the static pass could not have found.
+
+Everything above `Route A — CLOSED` stands as measured; it is simply no longer the way in.
 
 ## Route B — the compiled definition files
 
@@ -201,11 +259,60 @@ The lever that makes this tractable: dump a definition **live** from memory (alr
 possible), then find that same record in the file by its distinctive field values. That
 converts format reversing from cold analysis into a matching exercise.
 
+### The engine still contains the def *writer* — and two ini lines reach it
+
+This came out of Route A and is the most valuable thing it produced.
+
+The definition loader branches on the runtime copy of `UseCompiledDefs` at `0x009B08E2`:
+
+```asm
+mov  al, byte ptr [0x13CA7D8]     ; UseCompiledDefs, runtime copy
+test al, al
+je   0x009B09BB                   ; FALSE -> the uncompiled path
+...                               ; TRUE  -> open(file, mode 1)  = READ  @0x009B091F
+0x009B09BB:                       ; FALSE -> ... open(file, mode 4) = WRITE @0x009B0A26
+```
+
+Both branches operate on the same file object at `defmgr+0xB8`; only the mode differs.
+The write side is gated on the byte at `0x0138E188`, and that byte is a straight copy of
+the `AllowDataGeneration` console variable:
+
+```asm
+0x004025D5  mov al,  byte ptr [0x1375459]   ; AllowDataGeneration
+0x004025DA  mov byte ptr [0x138E188], al    ; data-write flag
+0x004025DF  mov byte ptr [0x138E189], al
+0x004025E4  mov byte ptr [0x138DD3B], al
+```
+
+`UseCompiledDefs` (`0x013B8617`) and `AllowDataGeneration` (`0x01375459`) are both live,
+registered console variables that `userst.ini` already sets — currently `TRUE` and `FALSE`.
+Flipping them is a two-line text edit, no injection at all.
+
+If the write path does what its shape says, **the retail build can serialise the compiled
+def format itself**, which is far better than reversing the reader: modify definitions in
+memory (already proven possible) and have the engine emit a persistent `.bin`.
+
+Not yet observed — this is read from the disassembly, not run. The obvious risk is that with
+`UseCompiledDefs FALSE` the engine first has to *load* defs from the uncompiled source,
+which retail almost certainly does not ship, so the run may fail before it ever writes. That
+is exactly what the experiment is for, and it is cheap and fully reversible.
+
+**The experiment:** back up `userst.ini`, set `UseCompiledDefs FALSE;` and
+`AllowDataGeneration TRUE;`, launch, and watch whether anything under `data/CompiledDefs/`
+is opened for write or rewritten. It needs a relaunch, so it was not run in the session that
+found it.
+
 ## Recommendation
 
-Run A first — it is days of work, not weeks, and `CommandList` may hand over most of what is
-wanted without any further reverse engineering. Then B as the durable answer, because it is
-the only one that gives control over screens the factory never constructs.
+**Route A is closed** — done, not abandoned. The console is already open (the ini files are
+its script input) and its entire 42-entry vocabulary reaches levels, quests, time, key
+bindings and the boot data pipeline, but never the UI. Do not spend more time on activating
+the input processor; it buys a prompt for commands that do not exist.
+
+**Route B is now the only route, and it starts with the writer, not the reader.** Run the
+`userst.ini` experiment above before touching the container format. If the engine will emit
+a `.bin`, the format never has to be reversed at all; if it will not, fall back to the
+live-dump-and-match plan, which is still the tractable version of cold analysis.
 
 Do not extend the runtime-attachment work further. Its reach has been measured and the
 Escape menu is outside it.
