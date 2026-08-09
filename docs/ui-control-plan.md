@@ -115,7 +115,41 @@ call dword ptr [edx]              ; destroy the old
   `"etR"`, `"utio"`, `"n"` — i.e. a small-string buffer for something like `SetResolution`.
   So command strings are reachable from these objects.
 
-Next: the console is fully built, so the remaining question is **activation** — what makes
+### The manager, and the activation difference
+
+Found by scanning for whatever points at a live console processor: the input-processor
+manager is at `0x0837FA08` (and the console processor's own `+0x18` points back at it, so
+`ctx[1]` is the manager). It holds a dense array of processor pointers:
+
+```
++0x160 = quick-access  0x05776CE8      <- active
++0x1E0 .. +0x204         ten more processors
++0x1F8 = console       0x057777D0      <- inactive
++0x208 = 00000001
+```
+
+There are four managers in play (`0x0837FA08`, `0x08369A70`, `0x0837FD40`, `0x083812C0`),
+which is why every processor class scans as four instances -- one per manager.
+
+**The difference between the active and inactive processor is in the object, not the slot:**
+
+```
+quick-access 0x05776CE8:  +04=05612CF0  +08=05776CE8  +0C=05776D28  +10=05776CB0
+console      0x057777D0:  +04=00000000  +08=00000000  +0C=00000000  +10=00000000
+```
+
+Both are registered in the manager's array; only the quick-access one has `+0x04..+0x10`
+populated. Note `+0x08` points at *itself* -- an intrusive list node. The base ctor
+`0x00687A30` only writes `+0x14..+0x24`, so `+0x04..+0x10` come from the class below it
+(`0x00A0D290`, called first). That is almost certainly enrolment in the active input chain:
+the console processor is *installed* but never *enrolled*.
+
+Next: disassemble `0x00A0D290` to confirm `+0x04..+0x10` is a list node, then find the
+enrol/unenrol pair -- whatever links quick-access into that chain is what has to be called
+for the console. Enrolling must happen on the game thread, so use the factory-breakpoint
+technique (INT3 + vectored handler matching **ExceptionAddress**), not an off-thread call.
+
+Old next step: the console is fully built, so the remaining question is **activation** — what makes
 the manager route input to slot `+0x1F8`. Look for a "current processor" pointer or an
 enabled flag on the manager that owns the slot, and compare it against the quick-access
 processor, which is demonstrably active. Then walk `CConsole+0x40` for the command list.

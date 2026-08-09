@@ -170,6 +170,77 @@ static void walk_container(const char *tag, DWORD p, int depth)
     }
 }
 
+/* Every address holding a pointer to `v`. */
+static int scan_ptr_to(DWORD v, DWORD *out, int max_out)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *addr = NULL;
+    int n = 0;
+    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        int own = g_own_stack &&
+                  (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
+                  (unsigned char *)g_own_stack < next;
+        if (!own && mbi.State == MEM_COMMIT &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+            unsigned char *p = (unsigned char *)mbi.BaseAddress, *e = next - 4;
+            for (; p <= e; p += 4)
+                if (*(DWORD *)p == v) { if (n < max_out) out[n] = (DWORD)(uintptr_t)p; n++; }
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
+    return n;
+}
+
+/*
+ * The console processor lives in slot +0x1F8 of the input-processor manager
+ * (0x00489C63). Find the manager by looking for whatever points at a live
+ * console processor, then locate the quick-access processor in the same object
+ * -- that one is demonstrably active, so any difference between the two slots,
+ * or any field pointing at one and not the other, is the activation mechanism.
+ */
+static void find_manager(void)
+{
+    DWORD ci[8], qa[8], holders[16];
+    int nc = scan_vtable(VT_INPUT_CONSOLE, ci, 8);
+    int nq = scan_vtable(VT_QUICKACCESS, qa, 8);
+    int i, j, k, nh;
+
+    plog("");
+    plog("=== input-processor manager ===");
+    if (!nc || !nq) { plog("  need both processors live; console=%d quick=%d", nc, nq); return; }
+    plog("  console proc  0x%08lX", ci[0]);
+    plog("  quickaccess   0x%08lX", qa[0]);
+
+    nh = scan_ptr_to(ci[0], holders, 16);
+    plog("  %d location(s) point at the console processor", nh);
+
+    for (i = 0; i < nh && i < 8; i++) {
+        DWORD h = holders[i], base;
+        int found_qa = 0;
+        /* the slot is +0x1F8, so the manager starts here */
+        base = h - 0x1F8;
+        plog("");
+        plog("  holder 0x%08lX -> manager would be 0x%08lX", h, base);
+        for (k = 0; k < 0x400; k += 4) {
+            DWORD v = rd(base + k);
+            for (j = 0; j < nq; j++)
+                if (v == qa[j]) {
+                    plog("    +0x%03X = quickaccess proc 0x%08lX", k, v);
+                    found_qa = 1;
+                }
+            for (j = 0; j < nc; j++)
+                if (v == ci[j]) plog("    +0x%03X = console proc     0x%08lX", k, v);
+        }
+        if (!found_qa) { plog("    (no quick-access processor nearby -- not the manager)"); continue; }
+        plog("    --- manager 0x%08lX, bytes +0x1E0..+0x220 ---", base);
+        for (k = 0x1E0; k < 0x220; k += 4)
+            plog("      +0x%03X = %08lX", k, rd(base + k));
+    }
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     int t;
@@ -205,6 +276,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
             walk_container("+0x4C", rd(hits[0] + 0x4C), 0);
         }
     }
+    find_manager();
     report("CTBaseSingleton<CConsole>", VT_CONSOLE_SINGLETON);
     report("CInputProcessConsole", VT_INPUT_CONSOLE);
     report("CConsoleCommandLine", VT_COMMAND_LINE);
