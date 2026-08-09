@@ -39,7 +39,8 @@
 #define FACTORY_TYPE_READ 0x0041D249u  /* mov eax,[ebx+0x3C] -- def in EBX  */
 
 #define DEF_TYPE   0x3C                /* component type in a definition    */
-#define DEF_ID     0x20                /* definition id (factory arg1)      */
+#define DEF_ID     0x20                /* def id -- what the factory takes  */
+#define DEF_REC    0x14                /* record id -- what a NAME resolves to */
 #define DEF_X      0x58
 #define DEF_Y      0x5C
 #define DEF_KIDS   0x70                /* vector<uint32> begin/end/cap      */
@@ -74,6 +75,7 @@ static volatile LONG  g_patched, g_hits;
 static volatile DWORD g_last_id;
 #define MAX_SEEN 128
 static volatile DWORD g_seen[MAX_SEEN];
+static volatile DWORD g_rec[MAX_SEEN], g_def[MAX_SEEN], g_ty[MAX_SEEN];
 static volatile LONG  g_seen_n;
 static unsigned char  g_orig_byte;
 static int            g_orig_saved;
@@ -169,15 +171,31 @@ static LONG CALLBACK bp_handler(EXCEPTION_POINTERS *ep)
          * the handler cannot filter by id. ui-probe.c patched 7-10 screens a
          * run this way with the game staying up.
          */
-        if (g_entry_id && (type == TYPE_SCREEN_A || type == TYPE_SCREEN_B)) {
+        if (1) {
             int seen = 0;
+            DWORD rec = *(DWORD *)(uintptr_t)(d + DEF_REC);
             for (i = 0; i < g_seen_n && i < MAX_SEEN; i++)
                 if (g_seen[i] == d) { seen = 1; break; }
             if (!seen) {
-                if (g_seen_n < MAX_SEEN) g_seen[g_seen_n++] = d;
+                if (g_seen_n < MAX_SEEN) {
+                    /* Log BOTH ids: a name resolves to the RECORD id (+0x14),
+                     * not the def id (+0x20) the factory is driven by. The
+                     * first cut compared the name lookup (8035) against +0x20
+                     * (values like 215), so it could never match. */
+                    g_rec[g_seen_n] = rec;
+                    g_def[g_seen_n] = id;
+                    g_ty[g_seen_n]  = type;
+                    g_seen[g_seen_n++] = d;
+                }
                 {
-                    DWORD b = *(DWORD *)(uintptr_t)(d + DEF_KIDS);
-                    DWORD e = *(DWORD *)(uintptr_t)(d + DEF_KIDS + 4);
+                    /* Only patch once a CText has been adopted. Appending
+                     * g_entry_id while it is still 0 makes the screen build a
+                     * null definition, which kills the game -- that is exactly
+                     * what happened when this block lost its g_entry_id guard. */
+                    DWORD b = (g_entry_id &&
+                               (type == TYPE_SCREEN_A || type == TYPE_SCREEN_B))
+                                ? *(DWORD *)(uintptr_t)(d + DEF_KIDS) : 0;
+                    DWORD e = b ? *(DWORD *)(uintptr_t)(d + DEF_KIDS + 4) : 0;
                     if (b > 0x10000 && e > b && (e - b) < POOL_ELEMS * 4 - 8) {
                         DWORD n = (e - b) / 4, k;
                         LONG slot = g_pool_next;
@@ -239,6 +257,7 @@ static DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD gsi = 0, defmgr = 0;
     int i, t;
+    LONG last_n = -1;
     (void)unused;
 
     g_log = fopen(LOG_PATH, "w");
@@ -272,9 +291,22 @@ static DWORD WINAPI probe_main(LPVOID unused)
 
     plog("open the Escape menu now");
     for (t = 0; t < 600; t++) {
-        plog("  t=%lds  hits=%ld  screens patched=%ld  entry id=%ld  last screen id=%ld",
-             (long)(t * 5), (long)g_hits, (long)g_patched,
-             (long)g_entry_id, (long)g_last_id);
+        if (g_seen_n != last_n) {
+            LONG k;
+            plog("  --- %ld definition(s) seen (record / def / type) ---",
+                 (long)g_seen_n);
+            for (k = 0; k < g_seen_n && k < MAX_SEEN; k++) {
+                int j, match = 0;
+                for (j = 0; j < N_SCREENS; j++)
+                    if (g_screen_id[j] && g_screen_id[j] == g_rec[k]) match = j + 1;
+                plog("      rec=%-6ld def=%-6ld type=0x%02lX %s", (long)g_rec[k],
+                     (long)g_def[k], (long)g_ty[k],
+                     match ? g_screen_names[match - 1] : "");
+            }
+            last_n = g_seen_n;
+        }
+        plog("  t=%lds  hits=%ld  screens patched=%ld  entry id=%ld",
+             (long)(t * 5), (long)g_hits, (long)g_patched, (long)g_entry_id);
         Sleep(5000);
     }
 
