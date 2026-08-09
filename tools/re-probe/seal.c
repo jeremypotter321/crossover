@@ -307,6 +307,21 @@ static int give_seal(DWORD gsi, DWORD hero)
  * armed once and disarmed by the handler itself -- re-arming while already
  * armed saves 0xCC as the "original" byte and corrupts the restore.
  */
+/*
+ * NPlayerGui::CDrawGuildSeal holds the charge state. Its vtable has only two
+ * entries, so the class is found by scanning for an object whose first dword is
+ * the vtable -- read-only, no code patched, nothing called on the game thread.
+ *
+ *   +0x2C  id being charged, -1 when idle
+ *   +0x30  charge timer (float), zeroed when the charge starts
+ *   +0x34  charging flag
+ *
+ * Watching these settles the hold-vs-tap question outright: a tap should show
+ * +0x34 go 1 and immediately back to 0 with +0x2C reset to -1, while a real
+ * hold should show +0x30 climbing toward the seal's 2.0s charge time.
+ */
+#define CDRAWGUILDSEAL_VT 0x0125A6BCu
+
 #define TRAP_ADDR 0x0068E76Bu
 
 static volatile DWORD g_trap_hits, g_trap_esi, g_trap_eax, g_trap_ebx;
@@ -333,6 +348,47 @@ static LONG CALLBACK trap_handler(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Scan committed memory for an object whose first dword is the vtable. */
+static DWORD find_seal_gui(void)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *addr = NULL;
+
+    while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+            unsigned char *p = (unsigned char *)mbi.BaseAddress;
+            unsigned char *e = next - 0x40;
+            for (; p <= e; p += 4)
+                if (*(DWORD *)p == CDRAWGUILDSEAL_VT)
+                    return (DWORD)(uintptr_t)p;
+        }
+        if (next <= addr) break;
+        addr = next;
+    }
+    return 0;
+}
+
+static void watch_charge(DWORD gui, DWORD *last_id, DWORD *last_flag, float *last_t)
+{
+    DWORD id, flag;
+    float t;
+
+    if (!readable(gui + 0x34)) return;
+    id   = rd(gui + 0x2C);
+    t    = *(float *)(uintptr_t)(gui + 0x30);
+    flag = *(unsigned char *)(uintptr_t)(gui + 0x34);
+
+    if (id != *last_id || flag != *last_flag ||
+        (t > *last_t + 0.05f) || (t < *last_t - 0.05f)) {
+        plog("    charge: id=%ld  timer=%d.%03d  charging=%lu",
+             (long)id, (int)t, (int)((t - (int)t) * 1000), flag);
+        *last_id = id; *last_flag = flag; *last_t = t;
+    }
 }
 
 static void arm_trap(void)
@@ -382,6 +438,8 @@ static void hold_menu_flag(DWORD gsi)
 {
     DWORD last = 0xFFFFFFFF, cleared = 0, seal_off = 0;
     int reported = 0;
+    DWORD gui = 0, c_id = 0xFFFFFFFE, c_flag = 0xFF;
+    float c_t = -1.0f;
     int i;
 
     plog("");
@@ -392,6 +450,13 @@ static void hold_menu_flag(DWORD gsi)
          readable(gsi + GSI_SEAL_ENABLED_OFF)
              ? *(unsigned char *)(uintptr_t)(gsi + GSI_SEAL_ENABLED_OFF) : 0xFF);
     arm_trap();
+
+    gui = find_seal_gui();
+    if (gui)
+        plog("  CDrawGuildSeal @0x%08lX -- watching the charge state.\n"
+             "  TAP the seal, then HOLD it for 3 seconds.", gui);
+    else
+        plog("  CDrawGuildSeal not found (vtable 0x%08X)", CDRAWGUILDSEAL_VT);
 
     for (i = 0; i < 7200; i++) {          /* ~30 min at 250 ms */
         DWORD hero = find_hero(gsi);
@@ -416,6 +481,8 @@ static void hold_menu_flag(DWORD gsi)
                 plog("      [esi+0x14]+0x%X unreadable", GSI_SEAL_ENABLED_OFF);
         }
 
+        if (gui) watch_charge(gui, &c_id, &c_flag, &c_t);
+
         if (!hero) { Sleep(250); continue; }
         p = (unsigned char *)(uintptr_t)(hero + HERO_MENU_FLAG_OFF);
         if (!readable(hero + HERO_MENU_FLAG_OFF)) { Sleep(250); continue; }
@@ -435,9 +502,51 @@ static void hold_menu_flag(DWORD gsi)
             cleared++;
             last = *p;
         }
-        Sleep(250);
+        Sleep(100);
     }
     plog("  the game cleared the menu bit %lu time(s), and the seal-enabled\n        byte %lu time(s), while we held them", cleared, seal_off);
+}
+
+/*
+ * Watch-only: pure memory reads, no call into game code at all.
+ *
+ * Everything that calls into the game -- the give, the container queries, even
+ * resolving the hero -- runs on the injected thread while the game thread is
+ * mid-frame. That raced and killed a live session: the log stopped exactly at
+ * "calling GiveHeroObject" with no return. The first few times it survived were
+ * luck, not correctness.
+ *
+ * Nothing here needs those calls. The hero already carries the seal, so the
+ * give was never necessary, and the charge state can be read straight out of
+ * CDrawGuildSeal. Reads cannot corrupt the game; at worst they see a torn value
+ * for one sample.
+ */
+static DWORD WINAPI watch_only(void)
+{
+    DWORD gui = 0, c_id = 0xFFFFFFFE, c_flag = 0xFF;
+    float c_t = -1.0f;
+    int i;
+
+    plog("=== seal: watch-only (no calls into game code) ===");
+    plog("waiting for CDrawGuildSeal (vtable 0x%08X)", CDRAWGUILDSEAL_VT);
+
+    for (i = 0; i < 18000; i++) {           /* ~30 min at 100 ms */
+        if (!gui) {
+            if (rd(GSI_PTR)) gui = find_seal_gui();
+            if (gui) {
+                plog("");
+                plog("CDrawGuildSeal @0x%08lX", gui);
+                plog("  id=-1 means idle. TAP the seal, then HOLD it 3 seconds.");
+            } else if (i % 100 == 0) {
+                plog("t=%3ds  not found yet", i / 10);
+            }
+        } else {
+            watch_charge(gui, &c_id, &c_flag, &c_t);
+        }
+        Sleep(100);
+    }
+    plog("=== watch complete ===");
+    return 0;
 }
 
 static DWORD WINAPI probe_main(LPVOID unused)
@@ -447,6 +556,13 @@ static DWORD WINAPI probe_main(LPVOID unused)
 
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) return 0;
+
+#ifndef ENABLE_GIVE
+    watch_only();
+    fclose(g_log);
+    g_log = NULL;
+    return 0;
+#endif
 
     plog("=== seal: give \"%s\" via CGameScriptInterface ===", SEAL_NAME);
     plog("waiting for a loaded game (singleton + world + hero)");
