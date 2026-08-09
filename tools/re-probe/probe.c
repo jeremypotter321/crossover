@@ -903,63 +903,110 @@ static void dismiss_dialogs(void)
 
 void on_definition(unsigned int def);
 
+/* Pre-allocated so the hook handler never calls into Win32. Allocating or
+ * calling IsBadReadPtr from inside the game's own dispatch is the re-entrancy
+ * that killed the process last time. */
+#define POOL_SLOTS 64
+#define POOL_ELEMS 64
+static DWORD *g_pool;
+static volatile LONG g_pool_next;
+
+/* Plausible-pointer test that costs nothing and needs no API. The definition
+ * is safe to read regardless: the very next instruction the game runs
+ * dereferences it. */
+#define PLAUSIBLE(p) ((p) >= 0x00400000u && (p) < 0x20000000u)
+
 void on_definition(unsigned int def)
 {
-    if (!def || IsBadReadPtr((void *)(uintptr_t)(def + TYPE_OFF), 4)) return;
-    if (*(DWORD *)(uintptr_t)(def + TYPE_OFF) != 0x0A) return;      /* screens */
-    if (IsBadReadPtr((void *)(uintptr_t)(def + 0x78), 4)) return;
-    if (!g_text_id) return;
-    {
-        DWORD b = *(DWORD *)(uintptr_t)(def + 0x70);
-        DWORD e = *(DWORD *)(uintptr_t)(def + 0x74);
-        DWORD n, k, *nv;
-        if (b < 0x10000 || e <= b || (e - b) > 0x400) return;
-        n = (e - b) / 4;
-        for (k = 0; k < n; k++)                    /* already extended? */
-            if (*(DWORD *)(uintptr_t)(b + k * 4) == g_text_id) return;
-        nv = (DWORD *)VirtualAlloc(NULL, (n + 2) * 4,
-                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!nv) return;
-        for (k = 0; k < n; k++) nv[k] = *(DWORD *)(uintptr_t)(b + k * 4);
-        nv[n] = g_text_id;
-        *(DWORD *)(uintptr_t)(def + 0x70) = (DWORD)(uintptr_t)nv;
-        *(DWORD *)(uintptr_t)(def + 0x74) = (DWORD)(uintptr_t)(nv + n + 1);
-        *(DWORD *)(uintptr_t)(def + 0x78) = (DWORD)(uintptr_t)(nv + n + 1);
-        g_hook_hits++;
-    }
+    DWORD b, e, n, k, *nv;
+    LONG slot;
+
+    if (!g_pool || !g_text_id) return;
+    if (g_hook_hits >= 1) return;   /* one screen only: limit the blast radius */
+    if (!PLAUSIBLE(def)) return;
+    if (*(DWORD *)(uintptr_t)(def + TYPE_OFF) != 0x0A) return;   /* screens */
+
+    b = *(DWORD *)(uintptr_t)(def + 0x70);
+    e = *(DWORD *)(uintptr_t)(def + 0x74);
+    if (!PLAUSIBLE(b) || e <= b || (e - b) > 0x200) return;
+    n = (e - b) / 4;
+    if (n + 1 >= POOL_ELEMS) return;
+
+    for (k = 0; k < n; k++)                       /* already extended? */
+        if (*(DWORD *)(uintptr_t)(b + k * 4) == g_text_id) return;
+
+    slot = g_pool_next;
+    if (slot >= POOL_SLOTS) return;
+    g_pool_next = slot + 1;
+
+    nv = g_pool + (DWORD)slot * POOL_ELEMS;
+    for (k = 0; k < n; k++) nv[k] = *(DWORD *)(uintptr_t)(b + k * 4);
+    nv[n] = g_text_id;
+
+    *(DWORD *)(uintptr_t)(def + 0x70) = (DWORD)(uintptr_t)nv;
+    *(DWORD *)(uintptr_t)(def + 0x74) = (DWORD)(uintptr_t)(nv + n + 1);
+    *(DWORD *)(uintptr_t)(def + 0x78) = (DWORD)(uintptr_t)(nv + n + 1);
+    g_hook_hits++;
 }
 
-__attribute__((naked)) static void hook_stub(void)
+/*
+ * Hand-assembled trampoline.
+ *
+ * Relying on __attribute__((naked)) here was a mistake -- x86 GCC support for
+ * it is unreliable, and a compiler-inserted prologue on this path corrupts the
+ * stack and kills the game. Emitting the bytes directly removes the compiler
+ * from the equation entirely.
+ *
+ *   60                pushad
+ *   9C                pushfd
+ *   53                push ebx              ; the definition
+ *   B8 <on_definition>
+ *   FF D0             call eax
+ *   83 C4 04          add esp,4
+ *   9D                popfd
+ *   61                popad                 ; flags/regs restored BEFORE the cmp
+ *   8B 43 3C          mov eax,[ebx+0x3C]    ; original
+ *   83 F8 2B          cmp eax,0x2B          ; original -- sets flags for the ja
+ *   68 <0x0041D24F>   push resume
+ *   C3                ret
+ */
+static unsigned char *build_stub(void)
 {
-    __asm__ __volatile__(
-        "pushal\n\t"
-        "pushfl\n\t"
-        "pushl %ebx\n\t"
-        "call _on_definition\n\t"
-        "addl $4, %esp\n\t"
-        "popfl\n\t"
-        "popal\n\t"
-        "movl 0x3c(%ebx), %eax\n\t"   /* original */
-        "cmpl $0x2b, %eax\n\t"        /* original -- sets flags for the ja */
-        "pushl $0x0041D24F\n\t"
-        "ret\n\t"
-    );
+    unsigned char *p = (unsigned char *)VirtualAlloc(NULL, 64,
+                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    int i = 0;
+    if (!p) return NULL;
+    p[i++] = 0x60;                                   /* pushad */
+    p[i++] = 0x9C;                                   /* pushfd */
+    p[i++] = 0x53;                                   /* push ebx */
+    p[i++] = 0xB8; *(DWORD *)(p + i) = (DWORD)(uintptr_t)on_definition; i += 4;
+    p[i++] = 0xFF; p[i++] = 0xD0;                    /* call eax */
+    p[i++] = 0x83; p[i++] = 0xC4; p[i++] = 0x04;     /* add esp,4 */
+    p[i++] = 0x9D;                                   /* popfd */
+    p[i++] = 0x61;                                   /* popad */
+    p[i++] = 0x8B; p[i++] = 0x43; p[i++] = 0x3C;     /* mov eax,[ebx+0x3C] */
+    p[i++] = 0x83; p[i++] = 0xF8; p[i++] = 0x2B;     /* cmp eax,0x2B */
+    p[i++] = 0x68; *(DWORD *)(p + i) = HOOK_RESUME; i += 4;
+    p[i++] = 0xC3;                                   /* ret */
+    return p;
 }
 
 static int install_inline_hook(void)
 {
     DWORD prot;
     unsigned char *at = (unsigned char *)(uintptr_t)HOOK_SITE;
-    int rel = (int)((DWORD)(uintptr_t)hook_stub - (HOOK_SITE + 5));
+    unsigned char *stub = build_stub();
+    int rel;
+    if (!stub) return 0;
+    rel = (int)((DWORD)(uintptr_t)stub - (HOOK_SITE + 5));
     if (!VirtualProtect(at, 8, PAGE_EXECUTE_READWRITE, &prot)) return 0;
-    at[0] = 0xE9;                         /* jmp rel32 */
+    at[0] = 0xE9;                        /* jmp rel32 */
     *(int *)(at + 1) = rel;
-    at[5] = 0x90;                         /* nop the 6th byte */
+    at[5] = 0x90;                        /* nop the 6th byte */
     VirtualProtect(at, 8, prot, &prot);
     return 1;
 }
-
-static DWORD WINAPI probe_main(LPVOID unused)
+DWORD WINAPI probe_main(LPVOID unused)
 {
     DWORD lists[MAX_OBJ], texts[MAX_OBJ];
     int nl, i, t, marker;
@@ -989,12 +1036,21 @@ static DWORD WINAPI probe_main(LPVOID unused)
      * VirtualAlloc/IsBadReadPtr from inside the game's dispatch and that
      * re-entrancy kills it. Needs a pre-allocated buffer and no Win32 calls in
      * the handler before it can be enabled. */
+    g_pool = (DWORD *)VirtualAlloc(NULL, POOL_SLOTS * POOL_ELEMS * 4,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    plog("child-list pool: %s", g_pool ? "allocated" : "FAILED");
 #ifdef ENABLE_INLINE_HOOK
     plog("inline hook at 0x%08X: %s", HOOK_SITE,
          install_inline_hook() ? "installed" : "FAILED");
 #else
+    /* Disabled: the trampoline still kills the game even patching a single
+     * screen, so the fault is the hook itself, not the injection. Prime
+     * suspect is the jmp rel32 -- VirtualAlloc can place the stub more than
+     * 2GB from 0x0041D249, which silently overflows the displacement. Fix is
+     * to allocate the stub near the image (VirtualAlloc with a preferred base
+     * walking up from 0x00400000) and verify the delta fits in rel32. */
     (void)install_inline_hook;
-    plog("inline hook: compiled but disabled (unsafe re-entrancy)");
+    plog("inline hook: disabled pending rel32-range fix");
 #endif
 
     /* Re-arm tightly: components are constructed in a burst, and each hit
