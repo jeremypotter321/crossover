@@ -57,6 +57,52 @@ Steps:
    holds the input processors, using the captured context struct.
 5. With a console: `CommandList` → the full vocabulary, then drive the UI from there.
 
+## Route A — measured results
+
+`tools/re-static/rtti.py` resolves class name -> vtable properly (it validates the complete
+object locator; a naive "first dword pointing at the type descriptor" matches base-class
+arrays and finds nothing for these classes). Verified against a known answer: it reproduces
+`CInputProcessQuickAccessItems` -> `0x01237AE0`.
+
+| Class | vtable | Constructed at |
+| --- | --- | --- |
+| `CConsole` | `0x0129C600` | `0x009ECD85`, `0x009ECF38` |
+| `CTBaseSingleton<CConsole>` | `0x0129C44C` | — |
+| `CInputProcessConsole` | `0x01237F24` | `0x0048B380` (ctor), installed at `0x00489C63` |
+| `CConsoleCommandLine` | `0x0129C400` | eight sites in `0x009EA2C2`..`0x009EEB28` |
+
+`CInputProcessConsole` is installed into **slot `+0x1F8`** of the input-processor manager,
+by the same code that installs the other processors:
+
+```asm
+mov  ecx, dword ptr [esi+0x1F8]   ; existing
+mov  dword ptr [esi+0x1F8], edi   ; <- the new CInputProcessConsole
+call dword ptr [edx]              ; destroy the old
+```
+
+**Measured live, read-only, at the frontend:**
+
+- `CConsole` **is instantiated** at `0x02C9DF68` — vtable correct, two embedded
+  `CConsoleCommandLine` objects at `+0x1C` and `+0x2C`, and three more command lines live
+  elsewhere. The console object genuinely exists in the retail build.
+- `CInputProcessConsole` did **not** scan as live at the frontend. Neither did
+  `CInputProcessQuickAccessItems`, which is known to be live in-game — so the processors are
+  created on level load, not at startup. Re-scan in-game before concluding anything.
+
+`CConsole` field map so far (from `0x02C9DF68`):
+
+| Offset | Value | Reading |
+| --- | --- | --- |
+| `+0x04`, `+0x10` | `0x02C9E018`, `0x02C9E040` | containers, not yet walked |
+| `+0x1C`, `+0x2C` | `0x0129C400` | embedded `CConsoleCommandLine` |
+| `+0x40`/`+0x44` | ptr / `0x0F` | pointer+count pair |
+| `+0x4C`/`+0x50`/`+0x54`/`+0x58` | ptrs / `9` | pointer+count pair |
+| `+0x6C`, `+0x70`, `+0x7C` | `0x60`, `0x29`, `0xFF` | probably geometry / colour |
+
+Next: walk `+0x04` and `+0x10` for the command registry (what `CommandList` enumerates), and
+re-scan for `CInputProcessConsole` **in-game**. Note the scan matches the probe's own heap
+and stack too; re-verify each hit and exclude the probe's own regions.
+
 ## Route B — the compiled definition files
 
 `data/CompiledDefs/{game,frontend,script}.bin` are the actual source of truth for every UI
