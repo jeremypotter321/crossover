@@ -315,8 +315,13 @@ static PVOID g_veh;
 
 static LONG CALLBACK trap_handler(PEXCEPTION_POINTERS ep)
 {
+    /* Accept both EIP conventions. An x86 INT3 normally reports EIP just past
+     * the 0xCC, but Wine has been seen to report it AT the trap byte, and the
+     * first version of this only matched TRAP_ADDR+1 -- so the breakpoint fell
+     * through to CONTINUE_SEARCH, nothing handled it, and the game died. */
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
-        ep->ContextRecord->Eip == TRAP_ADDR + 1) {
+        (ep->ContextRecord->Eip == TRAP_ADDR + 1 ||
+         ep->ContextRecord->Eip == TRAP_ADDR)) {
         /* Restore the byte in place -- no Win32 calls on the game's own
          * dispatch path; the page was left writable when it was armed. */
         *(unsigned char *)TRAP_ADDR = g_trap_orig;
@@ -333,6 +338,16 @@ static LONG CALLBACK trap_handler(PEXCEPTION_POINTERS ep)
 static void arm_trap(void)
 {
     DWORD old;
+#ifndef ENABLE_SEAL_TRAP
+    /*
+     * OFF by default, and it stays that way. This crashed a live session, and
+     * with no save games a crash costs the whole tutorial -- which cannot be
+     * re-saved either, because saving is behind the very menu being debugged.
+     * Build with -DENABLE_SEAL_TRAP only when that cost is acceptable.
+     */
+    plog("  INT3 trap disabled (build with -DENABLE_SEAL_TRAP to arm it)");
+    return;
+#endif
     if (!VirtualProtect((void *)TRAP_ADDR, 1, PAGE_EXECUTE_READWRITE, &old)) {
         plog("  could not make 0x%08X writable: %lu", TRAP_ADDR, GetLastError());
         return;
