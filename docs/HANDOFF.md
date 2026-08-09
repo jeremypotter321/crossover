@@ -75,15 +75,21 @@ definition ids**.
 **Components:** `+0x20` → CharString → definition name · **`+0x038` render Y (30 per menu
 row, live-editable, proven)**. Horizontal position field is **unknown** — `+0x034` disproved.
 
-### Guild seal (current task)
+### Guild seal (current task) — see `docs/guild-seal.md`
+
+> **`0x0058EEEC` in the previous revision of this file was wrong.** It is a `jmp` inside an
+> unrelated function starting at `0x0058EEC6`, not an entry point, and it gives nothing.
+> Do not spend time on it.
 
 | Address / name | What |
 | --- | --- |
-| `OBJECT_GUILD_SEAL_1` | the seal definition (also `OBJECT_GUILDSEAL_BASE` / `_FULL`) |
-| `CREATURE_HERO_CHILD` | the tutorial hero definition |
-| `0x0058EEEC` | **function that resolves the seal by name** — contains the whole give sequence, takes the recipient at `[ebp+8]` |
-| `0x0058EF87` | the `push "OBJECT_GUILD_SEAL_1"` inside it |
-| `GiveHero` / `TakeObjectFromHero` | script commands; the dispatcher is a `strncmp` chain around `0x00CC6390`, implementations inline |
+| `OBJECT_GUILD_SEAL_1` | the seal object — **definition id 4305**, verified live |
+| `*(void**)0x0143E8F8` | `CGameScriptInterface` singleton, vtable `0x01260F0C` |
+| `0x008902E0` | **`GiveHeroObject(CharString*, int, int)`** = `vtable+0x1E4`. This is the give. |
+| `0x00D489B5` | `Q_GuildTrainingDeparture` calling it with `("OBJECT_GUILD_SEAL_1", -1, 1)` |
+| `0x00CC6390` | the `GiveHero` script-command arm that does the same |
+| `hero+0x20` / `hero+0x44` | container-slot bitset / `map<slot, container*>`; the seal UI reads **slot 0x11** |
+| `0x0064A3AC` | `HUD_ORB_QUEST_CORE`, gates on slot `0x11` holding the seal |
 
 ---
 
@@ -106,7 +112,7 @@ row, live-editable, proven)**. Horizontal position field is **unknown** — `+0x
 | "Hello World" on the main menu, right side | Text renders, but the *injected* definition and the *rewritten* string are different definitions. Pin one definition id and rewrite that one string. |
 | Horizontal position | Field unidentified. Find it the way `+0x038` was found: write a distinctive value and observe. |
 | Inline hook at `0x0041D249` | Installs, then kills the game even patching one screen. Disabled behind `ENABLE_INLINE_HOOK`. **Prime suspect: `VirtualAlloc` can place the stub >2GB away, overflowing the `jmp rel32`.** Fix: allocate near the image and assert the delta fits. |
-| Guild seal | Next step is calling `0x0058EEEC` with the hero once one exists. |
+| Guild seal menu | The give works and is verified (`docs/guild-seal.md`), but the seal was **already in the tutorial hero's slot 0x11 with count 1 before any give** — possession was never the missing piece. Pressing the seal button still does not open the menu, so the gate is game/quest state. Not yet located. |
 
 ---
 
@@ -156,8 +162,11 @@ row, live-editable, proven)**. Horizontal position field is **unknown** — `+0x
 
 ## 8. Suggested next actions, in order
 
-1. **Guild seal:** call `0x0058EEEC` with the hero as its argument once a hero exists, using
-   the inline-asm thiscall helpers already in `probe.c`.
+1. **Guild seal menu:** find what blocks it. The item is present and the hero owns the slot,
+   so trace the input → `GAME_ACTION_*` dispatch and see whether the menu-open path is even
+   reached when the button is pressed. If it is reached, follow the early-out; if it is not,
+   the gate is in the action mapping. Candidate predicate already found:
+   `0x00661F70(hero)` = `hero[0xE0][0xC4] == 1`, which `HUD_ORB_QUEST_CORE` bails on.
 2. **Fix the inline hook** (`rel32` range), which removes all the INT3 re-arm racing.
 3. **Finish "Hello World"**: pin one definition id, rewrite that definition's string, find the
    horizontal field.
