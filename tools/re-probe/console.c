@@ -31,6 +31,7 @@
 #define GSI_PTR 0x0143E8F8u
 
 static FILE *g_log;
+static void *g_own_stack;
 
 static void plog(const char *fmt, ...)
 {
@@ -62,7 +63,10 @@ static int scan_vtable(DWORD vt, DWORD *out, int max_out)
 
     while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
         unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
-        if (mbi.State == MEM_COMMIT &&
+        int own = g_own_stack &&
+                  (unsigned char *)g_own_stack >= (unsigned char *)mbi.BaseAddress &&
+                  (unsigned char *)g_own_stack < next;
+        if (!own && mbi.State == MEM_COMMIT &&
             !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
             unsigned char *p = (unsigned char *)mbi.BaseAddress;
@@ -143,10 +147,35 @@ static void deep_console(void)
     }
 }
 
+/* Walk a candidate container: MSVC std::map/list nodes are {left,parent,right,
+ * key,...}; std::vector is {begin,end,cap}. Report anything reachable that
+ * looks like a command name. */
+static void walk_container(const char *tag, DWORD p, int depth)
+{
+    int k;
+    if (depth > 3 || !readable(p)) return;
+    plog("    %s @0x%08lX:", tag, p);
+    for (k = 0; k < 0x20; k += 4) {
+        DWORD v = rd(p + k);
+        if (!v) continue;
+        plog("        +0x%02X = %08lX", k, v);
+        dump_str_at("      str", v);
+        if (readable(v)) {
+            dump_str_at("      *ptr", rd(v));
+            if (depth < 2) {
+                DWORD w = rd(v);
+                if (readable(w)) dump_str_at("      **ptr", rd(w));
+            }
+        }
+    }
+}
+
 static DWORD WINAPI probe_main(LPVOID unused)
 {
     int t;
+    int marker;
     (void)unused;
+    g_own_stack = &marker;
 
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) return 0;
@@ -165,6 +194,17 @@ static DWORD WINAPI probe_main(LPVOID unused)
     report("CInputProcessQuickAccess", VT_QUICKACCESS);
     report("CConsole", VT_CONSOLE);
     deep_console();
+    {
+        DWORD hits[4];
+        if (scan_vtable(VT_CONSOLE, hits, 4) && rd(hits[0]) == VT_CONSOLE) {
+            plog("");
+            plog("  --- walking CConsole containers ---");
+            walk_container("+0x04", rd(hits[0] + 0x04), 0);
+            walk_container("+0x10", rd(hits[0] + 0x10), 0);
+            walk_container("+0x40", rd(hits[0] + 0x40), 0);
+            walk_container("+0x4C", rd(hits[0] + 0x4C), 0);
+        }
+    }
     report("CTBaseSingleton<CConsole>", VT_CONSOLE_SINGLETON);
     report("CInputProcessConsole", VT_INPUT_CONSOLE);
     report("CConsoleCommandLine", VT_COMMAND_LINE);

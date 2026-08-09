@@ -99,9 +99,26 @@ call dword ptr [edx]              ; destroy the old
 | `+0x4C`/`+0x50`/`+0x54`/`+0x58` | ptrs / `9` | pointer+count pair |
 | `+0x6C`, `+0x70`, `+0x7C` | `0x60`, `0x29`, `0xFF` | probably geometry / colour |
 
-Next: walk `+0x04` and `+0x10` for the command registry (what `CommandList` enumerates), and
-re-scan for `CInputProcessConsole` **in-game**. Note the scan matches the probe's own heap
-and stack too; re-verify each hit and exclude the probe's own regions.
+**Re-scanned in-game, with the probe's own stack region excluded — both questions answered:**
+
+- `CInputProcessConsole` **is live in-game: 4 instances** (`0x057777D0`, `0x0836AF40`,
+  `0x083811C0`, `0x08382720`), exactly mirroring the 4 live `CInputProcessQuickAccessItems`.
+  They share context pointers `+0x14 = 0x05616408` and `+0x1C = 0x05737E70`, the ctx[0]/ctx[2]
+  copied by the base ctor `0x00687A30`. The console's input processor is constructed and
+  installed in the retail build. Nothing needs to be created — only activated.
+- `CConsole+0x04` and `+0x10` are **empty lists** — `[+0x08] == [+0x0C] == self`, the MSVC
+  empty-list sentinel. Not the registry.
+- `CConsole+0x40/+0x44` **is** a live container, and its count **grew 15 → 18** between the
+  frontend and in-game, so it accumulates at run time. `+0x40` derefs to three real pointers
+  (`0x0835B868`, `0x080F5740`, `0x055E6590`). This is the one to walk.
+- `CConsoleCommandLine` instances carry inline command text: `0x02CA1CE8` holds fragments
+  `"etR"`, `"utio"`, `"n"` — i.e. a small-string buffer for something like `SetResolution`.
+  So command strings are reachable from these objects.
+
+Next: the console is fully built, so the remaining question is **activation** — what makes
+the manager route input to slot `+0x1F8`. Look for a "current processor" pointer or an
+enabled flag on the manager that owns the slot, and compare it against the quick-access
+processor, which is demonstrably active. Then walk `CConsole+0x40` for the command list.
 
 ## Route B — the compiled definition files
 
