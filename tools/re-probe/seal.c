@@ -67,6 +67,23 @@
 #define HERO_MENU_FLAG_OFF  0x38u
 #define HERO_MENU_FLAG_BIT  0x40u
 
+/*
+ * ...but that bit turned out to be set already on the tutorial hero. The gate
+ * that actually stops the seal is in the CHARGE_GUILD_SEAL handler at
+ * 0x0068E510, which -- once it has confirmed the hero is carrying the seal --
+ * checks one byte on the script interface and gives up if it is zero:
+ *
+ *     call 0x005BDF08              ; carrying the seal?
+ *     test eax, eax / jle <bail>
+ *     mov  eax, [esi+0x14]         ; the CGameScriptInterface
+ *     mov  cl, byte ptr [eax+0xD5]
+ *     test cl, cl  / je <bail>     ; <-- using the seal silently does nothing
+ *
+ * Nothing else on the seal path reads it, so it reads as "the guild seal is
+ * enabled" -- the switch the story throws when the seal stops being a prop.
+ */
+#define GSI_SEAL_ENABLED_OFF 0xD5u
+
 static FILE *g_log;
 
 static void plog(const char *fmt, ...)
@@ -279,6 +296,67 @@ static int give_seal(DWORD gsi, DWORD hero)
 }
 
 /*
+ * A one-shot INT3 at the instruction just past "is the hero carrying the seal",
+ * inside the CHARGE_GUILD_SEAL handler. Reaching it proves the handler runs
+ * when the seal is used, and captures ESI -- the handler object -- which is the
+ * only way to reach the manager at [esi+0x14] whose +0xD5 byte gates the seal.
+ * That object is NOT the CGameScriptInterface singleton: gsi+0xD5 reads 0x37,
+ * which is data, not a flag.
+ *
+ * Guard pages never fire under Wine; INT3 plus a vectored handler does. It is
+ * armed once and disarmed by the handler itself -- re-arming while already
+ * armed saves 0xCC as the "original" byte and corrupts the restore.
+ */
+#define TRAP_ADDR 0x0068E76Bu
+
+static volatile DWORD g_trap_hits, g_trap_esi, g_trap_eax, g_trap_ebx;
+static unsigned char g_trap_orig;
+static PVOID g_veh;
+
+static LONG CALLBACK trap_handler(PEXCEPTION_POINTERS ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        ep->ContextRecord->Eip == TRAP_ADDR + 1) {
+        /* Restore the byte in place -- no Win32 calls on the game's own
+         * dispatch path; the page was left writable when it was armed. */
+        *(unsigned char *)TRAP_ADDR = g_trap_orig;
+        ep->ContextRecord->Eip = TRAP_ADDR;
+        g_trap_esi = ep->ContextRecord->Esi;
+        g_trap_eax = ep->ContextRecord->Eax;
+        g_trap_ebx = ep->ContextRecord->Ebx;
+        g_trap_hits++;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void arm_trap(void)
+{
+    DWORD old;
+    if (!VirtualProtect((void *)TRAP_ADDR, 1, PAGE_EXECUTE_READWRITE, &old)) {
+        plog("  could not make 0x%08X writable: %lu", TRAP_ADDR, GetLastError());
+        return;
+    }
+    g_trap_orig = *(unsigned char *)TRAP_ADDR;
+    if (g_trap_orig == 0xCC) {
+        plog("  0x%08X is already 0xCC -- refusing to arm over an armed trap",
+             TRAP_ADDR);
+        return;
+    }
+    g_veh = AddVectoredExceptionHandler(1, trap_handler);
+    if (!g_veh) {
+        plog("  AddVectoredExceptionHandler failed");
+        return;
+    }
+    *(unsigned char *)TRAP_ADDR = 0xCC;
+    /* Deliberately left PAGE_EXECUTE_READWRITE: the handler restores the byte
+     * and must not call VirtualProtect from the dispatch path. EXECUTE is kept,
+     * so the page stays fetchable. */
+    plog("  armed INT3 at 0x%08X (original byte 0x%02X) -- now use the seal",
+         TRAP_ADDR, g_trap_orig);
+}
+
+/*
  * Hold the in-game-menu bit set. It is done in a loop rather than once because
  * the tutorial may well clear it again every frame -- and if it does, the log
  * says so instead of leaving us guessing why one write "did not take".
@@ -287,16 +365,41 @@ static int give_seal(DWORD gsi, DWORD hero)
  */
 static void hold_menu_flag(DWORD gsi)
 {
-    DWORD last = 0xFFFFFFFF, cleared = 0;
+    DWORD last = 0xFFFFFFFF, cleared = 0, seal_off = 0;
+    int reported = 0;
     int i;
 
     plog("");
-    plog("holding hero+0x%X bit 0x%02X set (the in-game menu gate)",
-         HERO_MENU_FLAG_OFF, HERO_MENU_FLAG_BIT);
+    plog("holding hero+0x%X bit 0x%02X and gsi+0x%X set",
+         HERO_MENU_FLAG_OFF, HERO_MENU_FLAG_BIT, GSI_SEAL_ENABLED_OFF);
+    plog("  gsi+0x%X reads 0x%02X right now",
+         GSI_SEAL_ENABLED_OFF,
+         readable(gsi + GSI_SEAL_ENABLED_OFF)
+             ? *(unsigned char *)(uintptr_t)(gsi + GSI_SEAL_ENABLED_OFF) : 0xFF);
+    arm_trap();
 
     for (i = 0; i < 7200; i++) {          /* ~30 min at 250 ms */
         DWORD hero = find_hero(gsi);
         unsigned char *p, v;
+
+        /* Report the trap the moment the seal handler runs. */
+        if (g_trap_hits && !reported) {
+            DWORD mgr = rd(g_trap_esi + 0x14);
+            reported = 1;
+            plog("");
+            plog("  *** 0x%08X reached -- the seal handler DID run ***", TRAP_ADDR);
+            plog("      esi(handler)=0x%08lX  eax=0x%08lX  ebx=0x%08lX",
+                 g_trap_esi, g_trap_eax, g_trap_ebx);
+            plog("      [esi+0x14] = 0x%08lX   (the manager the gate hangs off)", mgr);
+            if (readable(mgr + GSI_SEAL_ENABLED_OFF))
+                plog("      [esi+0x14]+0x%X = 0x%02X  -> the seal is %s",
+                     GSI_SEAL_ENABLED_OFF,
+                     *(unsigned char *)(uintptr_t)(mgr + GSI_SEAL_ENABLED_OFF),
+                     *(unsigned char *)(uintptr_t)(mgr + GSI_SEAL_ENABLED_OFF)
+                         ? "ENABLED" : "DISABLED -- this is the blocker");
+            else
+                plog("      [esi+0x14]+0x%X unreadable", GSI_SEAL_ENABLED_OFF);
+        }
 
         if (!hero) { Sleep(250); continue; }
         p = (unsigned char *)(uintptr_t)(hero + HERO_MENU_FLAG_OFF);
@@ -319,7 +422,7 @@ static void hold_menu_flag(DWORD gsi)
         }
         Sleep(250);
     }
-    plog("  the game cleared the bit %lu time(s) while we held it", cleared);
+    plog("  the game cleared the menu bit %lu time(s), and the seal-enabled\n        byte %lu time(s), while we held them", cleared, seal_off);
 }
 
 static DWORD WINAPI probe_main(LPVOID unused)
