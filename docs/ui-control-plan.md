@@ -144,10 +144,37 @@ populated. Note `+0x08` points at *itself* -- an intrusive list node. The base c
 (`0x00A0D290`, called first). That is almost certainly enrolment in the active input chain:
 the console processor is *installed* but never *enrolled*.
 
-Next: disassemble `0x00A0D290` to confirm `+0x04..+0x10` is a list node, then find the
-enrol/unenrol pair -- whatever links quick-access into that chain is what has to be called
-for the console. Enrolling must happen on the game thread, so use the factory-breakpoint
-technique (INT3 + vectored handler matching **ExceptionAddress**), not an off-thread call.
+### `CAInputProcess`, confirmed
+
+`0x00A0D290` is the base ctor and it does exactly one interesting thing: it sets vtable
+`0x0129CA10` and **zeroes `+0x04`, `+0x08`, `+0x0C`, `+0x10`**. RTTI says that vtable is
+`.?AVCAInputProcess@@` -- the base of every input processor. So those four fields start empty
+on *every* processor and are filled later by whatever engages one.
+
+Its first vtable slots (`0x00486360`, `0x00486380`, `0x00486390`) are empty base
+implementations (`ret` / `ret 4`), so the behaviour is all in the overrides.
+
+Worth noting before chasing "enrolment" too literally: only **one** quick-access instance has
+`+0x04..+0x10` populated -- the one belonging to manager `0x0837FA08`. The other three
+quick-access instances are zeroed exactly like all four console ones. So the fields may mark
+*the currently engaged processor of the active manager* rather than a permanent registration.
+Both readings lead to the same next move.
+
+**Next, in order:**
+
+1. Find who writes `CAInputProcess+0x04`. A scan for self-referencing list-head inits
+   (`mov [reg+8], reg`) near the input code found only `0x0048A1DD` and `0x0048AEC0`, and
+   neither is the processor -- `0x0048A1B0` initialises a different object with a 0x20-byte
+   node at `+0x10`. So search instead for writes to `+0x04` on an object whose vtable is
+   `0x0129CA10`, or breakpoint the write live.
+2. Cheaper and possibly decisive: watch manager `0x0837FA08` slots `+0x160` (quick-access)
+   and `+0x1F8` (console) **while opening and closing the Escape menu**. Whatever the engine
+   does to engage a processor will show up as a field change, read-only, no patching.
+3. Only then attempt the write -- and on the game thread via the factory breakpoint
+   (INT3 + vectored handler matching **ExceptionAddress**), never off-thread.
+
+Do (2) first. It is free, it cannot crash the session, and it shows the mechanism in action
+rather than inferring it.
 
 Old next step: the console is fully built, so the remaining question is **activation** — what makes
 the manager route input to slot `+0x1F8`. Look for a "current processor" pointer or an
