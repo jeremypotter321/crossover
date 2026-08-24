@@ -742,3 +742,54 @@ MEM_PRIVATE`.)
 Swapping to another stock CText gives another stock label. An arbitrary one needs the key
 at `CText +0x54` to resolve to text we choose — either by hooking the key lookup, or by
 learning what the game does with a key that is not in the bank.
+
+---
+
+## 16. CONFIRMED — arbitrary label text, for free
+
+Seen on screen 2026-08-24 by `tools/re-probe/menu-key.c`: the main menu's last row reads
+**Mods**.
+
+A CText's key is wide text reached as `CUIDef +0x54 -> CharString -> characters`, and it is
+resolved through the language bank when the component is built. **When the lookup misses,
+the game draws the key itself.** So a label needs no bank entry, no new definition and no
+hook — overwrite the key characters in place with the text you want:
+
+```
+CText 254 (Quit's label)
+  CharString 0x...908 -> characters 0x...928
+  "TEXT_GUI_MENU_QUIT"  ->  "Mods"
+```
+
+`L"Mods"` plus its terminator is 5 wide characters where `TEXT_GUI_MENU_QUIT` has 19, so
+the write is in place and nothing grows. Done in the factory window at `0x0041D249`, before
+the component exists — which is required, because the string is baked in at construction
+and there is no hot reload.
+
+### Never call Win32 from the breakpoint handler
+
+The first version of this hung the game: black screen, process alive, breakpoint armed and
+never hit. The only difference from the working probes was a `VirtualProtect` around the
+write. The handler runs inside the game's own component dispatch, and taking a loader or
+heap lock there deadlocks it — `menu-swap.c` survives the identical window purely because
+it writes plain memory and calls nothing.
+
+The key characters are heap data and already writable, so the `memcpy` needs no protection
+change at all. Rule for anything in this handler: **no allocation, no VirtualProtect, no
+logging — copy bytes and return.**
+
+### Where this leaves the menu
+
+Three of the four pieces of a mod's own menu entry are proved:
+
+| | how |
+| --- | --- |
+| a row exists | append an id to the list definition's child vector (section 13) |
+| which label it uses | swap the CText id in the row's child vector (section 15) |
+| what the label says | overwrite the CText's key in place (this section) |
+| **what it does** | **still unknown** |
+
+The remaining candidate for the action is the mirrored per-button pair at
+`CFrontEndButton CUIDef +0xC4/+0xE4` — 66, 16, 297, 67, 321, 314 across the six rows. It is
+eliminated as the text (writing Options' value over Quit's changed no label) but has never
+been tested as the action, because that needs a click.
