@@ -819,11 +819,24 @@ made by the same means.
 
 ### What the pause menu is made of
 
-It is a tab strip, not a row list. A type 8 holds the tabs; each tab is a type 7 carrying a
-label and a content container:
+**Two** tab strips, not one, and only the second has text:
 
 ```
-type 8  5964      the tab strip
+type 8  5892   the game tabs -- [5895 5894 5897 5896 5903 5893 5906 6061 6062]
+type 8  5964   the system tabs -- Save / Load / Options / Quit
+```
+
+`5892` is the icon strip: skills, inventory, map, quests and the rest. Its tabs are type 7
+with one or two children each (`[6060 6063]`, `[6060 6065]`, `[6060 6067]`, …) and **none of
+those children is a CText** -- they are sprites, which is why not one skill/inventory/quest
+label appears among the 83 text keys loaded. A tab there is an icon, so adding one means
+supplying artwork, not a string.
+
+`5964` is the text strip, and it is the practical place for a mod entry. A type 8 holds the
+tabs; each tab is a type 7 carrying a label and a content container:
+
+```
+type 8  5964      the text tab strip
   type 7  5947    [7004 6293 6354 6355 6356]           Save
   type 7  5948                                          Load
   type 7  5949    [7004 6295 6358 6365 6372 6187]      Gameplay Options
