@@ -350,11 +350,21 @@ static LONG CALLBACK trap_handler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* Scan committed memory for an object whose first dword is the vtable. */
-static DWORD find_seal_gui(void)
+/*
+ * Scan committed memory for objects whose first dword is the vtable.
+ *
+ * Taking the first match was wrong: it reported charging=19 and a non-negative
+ * idle id, neither of which the class can produce. The vtable constant also
+ * appears in places that are not a live instance, so collect every candidate
+ * and let the caller judge them by their field values.
+ */
+#define MAX_GUI_CANDIDATES 16
+
+static int find_seal_gui_all(DWORD *out, int max_out)
 {
     MEMORY_BASIC_INFORMATION mbi;
     unsigned char *addr = NULL;
+    int n = 0;
 
     while (VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
         unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
@@ -364,13 +374,24 @@ static DWORD find_seal_gui(void)
             unsigned char *p = (unsigned char *)mbi.BaseAddress;
             unsigned char *e = next - 0x40;
             for (; p <= e; p += 4)
-                if (*(DWORD *)p == CDRAWGUILDSEAL_VT)
-                    return (DWORD)(uintptr_t)p;
+                if (*(DWORD *)p == CDRAWGUILDSEAL_VT) {
+                    if (n < max_out) out[n] = (DWORD)(uintptr_t)p;
+                    n++;
+                }
         }
         if (next <= addr) break;
         addr = next;
     }
-    return 0;
+    return n;
+}
+
+/* The real instance is idle: id == -1 and the charging flag is 0 or 1. */
+static int looks_idle(DWORD gui)
+{
+    DWORD flag;
+    if (!readable(gui + 0x38)) return 0;
+    flag = *(unsigned char *)(uintptr_t)(gui + 0x34);
+    return rd(gui + 0x2C) == 0xFFFFFFFFu && flag <= 1;
 }
 
 static void watch_charge(DWORD gui, DWORD *last_id, DWORD *last_flag, float *last_t)
@@ -451,7 +472,10 @@ static void hold_menu_flag(DWORD gsi)
              ? *(unsigned char *)(uintptr_t)(gsi + GSI_SEAL_ENABLED_OFF) : 0xFF);
     arm_trap();
 
-    gui = find_seal_gui();
+    {
+        DWORD one[1];
+        gui = find_seal_gui_all(one, 1) ? one[0] : 0;
+    }
     if (gui)
         plog("  CDrawGuildSeal @0x%08lX -- watching the charge state.\n"
              "  TAP the seal, then HOLD it for 3 seconds.", gui);
@@ -523,25 +547,43 @@ static void hold_menu_flag(DWORD gsi)
  */
 static DWORD WINAPI watch_only(void)
 {
-    DWORD gui = 0, c_id = 0xFFFFFFFE, c_flag = 0xFF;
-    float c_t = -1.0f;
-    int i;
+    DWORD cand[MAX_GUI_CANDIDATES];
+    DWORD c_id[MAX_GUI_CANDIDATES], c_flag[MAX_GUI_CANDIDATES];
+    float c_t[MAX_GUI_CANDIDATES];
+    int n = 0, i, j;
 
     plog("=== seal: watch-only (no calls into game code) ===");
     plog("waiting for CDrawGuildSeal (vtable 0x%08X)", CDRAWGUILDSEAL_VT);
 
     for (i = 0; i < 18000; i++) {           /* ~30 min at 100 ms */
-        if (!gui) {
-            if (rd(GSI_PTR)) gui = find_seal_gui();
-            if (gui) {
-                plog("");
-                plog("CDrawGuildSeal @0x%08lX", gui);
-                plog("  id=-1 means idle. TAP the seal, then HOLD it 3 seconds.");
-            } else if (i % 100 == 0) {
-                plog("t=%3ds  not found yet", i / 10);
+        if (!n) {
+            if (rd(GSI_PTR)) {
+                int total = find_seal_gui_all(cand, MAX_GUI_CANDIDATES);
+                if (total) {
+                    n = total < MAX_GUI_CANDIDATES ? total : MAX_GUI_CANDIDATES;
+                    plog("");
+                    plog("%d object(s) carry the vtable%s:", total,
+                         total > n ? " (showing the first 16)" : "");
+                    for (j = 0; j < n; j++) {
+                        plog("  [%d] 0x%08lX  id=%ld  timer=%08lX  flag=%lu  %s",
+                             j, cand[j], (long)rd(cand[j] + 0x2C),
+                             rd(cand[j] + 0x30),
+                             (DWORD)*(unsigned char *)(uintptr_t)(cand[j] + 0x34),
+                             looks_idle(cand[j]) ? "<- idle, plausible" : "");
+                        c_id[j] = 0xFFFFFFFEu; c_flag[j] = 0xFF; c_t[j] = -1.0f;
+                    }
+                    plog("  now TAP the seal, then HOLD it 3 seconds.");
+                }
             }
+            if (!n && i % 100 == 0) plog("t=%3ds  not found yet", i / 10);
         } else {
-            watch_charge(gui, &c_id, &c_flag, &c_t);
+            for (j = 0; j < n; j++) {
+                DWORD pid = c_id[j], pf = c_flag[j];
+                float pt = c_t[j];
+                watch_charge(cand[j], &c_id[j], &c_flag[j], &c_t[j]);
+                if (pid != c_id[j] || pf != c_flag[j] || pt != c_t[j])
+                    plog("      ^ candidate [%d] @0x%08lX", j, cand[j]);
+            }
         }
         Sleep(100);
     }

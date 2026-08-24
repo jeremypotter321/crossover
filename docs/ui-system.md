@@ -617,3 +617,86 @@ The seventh row is a *stock* button, because a duplicated stock id is all that c
 appended so far: an id we invent does not resolve through the manager. Giving the row our
 own label and our own action needs either a definition the manager will resolve, or a
 post-construction rewrite of the built component's text and handler.
+
+---
+
+## 14. A menu row's label — found, and the reader bug that hid it
+
+### The chain
+
+A row's text is not in the button. It is three objects down:
+
+```
+button            type 11  CFrontEndButton            6 states
+ └─ middle        type 5   CChangingStateComponent    5 states, 2 children
+     ├─ label     type 6   CText                      <- the text
+     └─ art       type 2 -> type 0 CSprite (id 127, shared by all six rows)
+```
+
+and the CText definition names its string by **key**:
+
+| offset | holds |
+| --- | --- |
+| `CUIDef +0x54` | pointer to a `CharString` of the **wide** text key |
+| `CUIStateDef +0x20` | the same key, repeated in each of the 5 states |
+
+Read live from the six main-menu rows:
+
+| row | button | middle | CText | key |
+| --- | --- | --- | --- | --- |
+| Continue Game | 262 | 263 | 265 | `TEXT_GUI_MENU_CONTINUE_GAME` |
+| Change Profile | 247 | 248 | 250 | `TEXT_GUI_MENU_CHANGE_PROFILE` |
+| Options | 266 | 267 | 269 | `TEXT_GUI_MENU_OPTIONS` |
+| Credits | 280 | 283 | 285 | `TEXT_GUI_MENU_CREDITS` |
+| About | 255 | 256 | 257 | `TEXT_GUI_MENU_ABOUT` |
+| Quit | 251 | 252 | 254 | `TEXT_GUI_MENU_QUIT` |
+
+The resolved text (`Quit`, `Credits`, …) exists separately in the same heap, also
+UTF-16 — so there are two strings per row, the key and the localised result.
+
+### The bug that cost the most time here
+
+Section 8 and every probe before this one reported "no string is reachable from any of
+these definitions". **That was the reader, not the game.** The scanner walked bytes and
+stopped at the first NUL, so a wide key (`'T', 0, 'E', 0, …`) measured one character long
+and was discarded as noise. The game is localised; its text was never going to be ASCII.
+
+The cost of that was two false trails, both pursued to an experiment:
+
+- `CFrontEndButton CUIDef +0xC4/+0xE4` — a mirrored per-row integer (66, 16, 297, 67,
+  321, 314). Writing Options' value over Quit's changed nothing.
+- `CText CUIDef +0x38` — six distinct values that all fit in 16 bits, which looked exactly
+  like a string-table index. It is **not stable across runs** (Quit was 36145 in one
+  process and 1329 in the next), so it cannot be an authored id at all. Comparing the same
+  field across two launches would have killed this in a minute, and is worth doing to any
+  candidate id before building an experiment on it.
+
+### Two techniques worth keeping
+
+**Scan for definitions instead of catching them.** Every `CUIDef` starts with vtable
+`0x01259F8C` and carries its id at `+0x20`, so one pass over committed memory finds any
+definition by id — no breakpoint, no construction burst to race, nothing called in the
+game. This is how the six label definitions were finally read, after the factory
+breakpoint kept missing them: a child is constructed *after* its parent, and the probe
+disarmed as soon as it had all six parents.
+
+**Attach, do not relaunch.** `tools/re-probe/attach.exe` injects into the running game, so
+an iteration costs nothing. Every relaunch replays the intro and re-rolls Wine's
+`0x80040218` video dialog, which blocks the frontend from ever being built — and while it
+is up, a probe waiting on the main menu waits forever.
+
+### What is still open
+
+Changing the label is not yet demonstrated. Two things were tried and neither is the
+answer:
+
+- Editing the definition after the menu exists does nothing — the text is baked into the
+  component at construction, so a definition edit needs the screen rebuilt to show.
+- Rewriting every occurrence of the resolved wide text `Quit` -> `Mods` in writable memory
+  works when attached to a running game (16 sites rewritten, game stable), but doing the
+  same continuously from process start **killed the game**. It is too blunt: most of those
+  matches are in a system module's own string table, not the game's text bank.
+
+The clean route is the key, not the resolved text: point a row's `CText +0x54` at a
+`CharString` of our own before construction, and hook the key lookup so our key resolves
+to our label. That keeps the change to one row and needs no memory-wide rewriting.
