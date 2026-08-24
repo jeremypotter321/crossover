@@ -558,3 +558,62 @@ game staying up.
 > resulting screen was never photographed. The mechanism is evidenced by the data (child ids
 > in the definition, matching factory arg1 values, and the definition-swap result), not by a
 > screenshot. Clear the dialog with `wineserver -k` and re-run to confirm visually.
+
+---
+
+## 13. CONFIRMED — a seventh native entry in the main menu
+
+Done and seen on screen, 2026-08-24, by `tools/re-probe/menu-append.c`. The main menu
+rendered **seven** rows, the seventh being a second `Quit`, and clicking it opened the
+game's own "Are you sure you want to quit?" dialog. So the extra row is not a drawn
+decoration: it is a real `CFrontEndButton`, constructed by the factory and wired to its
+action by the game, exactly like the six it ships with.
+
+### The correction that made it work: the buttons hang off the *list*, not the screen
+
+Section 12 had the mechanism right and the target wrong. Appending to the **screen**
+definition (type `0x0A`) adds a child to the screen, which is not where the rows live.
+The menu rows are children of a **list** definition (type `0x0C`), and that is what has
+to be extended.
+
+Captured live, and the reason the six rows are the six rows:
+
+| definition | type | children |
+| --- | --- | --- |
+| `215` main menu screen | `0x0A` | `245`, `200`, `685` |
+| `245` main menu list | `0x0C` | `262`, `247`, `266`, `280`, `255`, `251` |
+
+Those six ids are, in rendered order: Continue Game, Change Profile, Options, Credits,
+About, **Quit = 251**. Appending `251` a second time is what produced the second Quit.
+
+### The other correction: emulate the instruction, do not re-arm it
+
+The INT3 at `0x0041D249` cannot use the usual restore-the-byte-and-re-run shape. Components
+are built in a burst of hundreds of factory calls inside a few milliseconds, so between the
+handler restoring the byte and a worker thread re-arming it, almost the whole burst goes
+past unseen. The first run of this probe caught four definitions out of dozens and the main
+menu was not among them — which reads exactly like "the mechanism does not work".
+
+There is no need to re-run the instruction. It is `mov eax,[ebx+0x3C]`: three bytes, no
+relative operand, and `mov` writes no flags. Perform it in the handler and resume past it:
+
+```c
+ep->ContextRecord->Eax = *(DWORD *)(ebx + 0x3C);
+ep->ContextRecord->Eip = 0x0041D249 + 3;
+```
+
+The INT3 then never leaves the code, every factory call is seen, and there is no race.
+
+### Do not call the definition manager from your own thread
+
+Reaching the manager works — it is at `container+0x64`, captured from a factory call. But
+calling `GetDefinition` (`0x009AD390`) on it from the probe's thread killed the process
+every time, while the frontend was being built. Identify definitions by their child ids,
+which is a pure read, rather than by name.
+
+### What is still open
+
+The seventh row is a *stock* button, because a duplicated stock id is all that can be
+appended so far: an id we invent does not resolve through the manager. Giving the row our
+own label and our own action needs either a definition the manager will resolve, or a
+post-construction rewrite of the built component's text and handler.
