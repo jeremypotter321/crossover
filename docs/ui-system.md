@@ -793,3 +793,74 @@ The remaining candidate for the action is the mirrored per-button pair at
 `CFrontEndButton CUIDef +0xC4/+0xE4` — 66, 16, 297, 67, 321, 314 across the six rows. It is
 eliminated as the text (writing Options' value over Quit's changed no label) but has never
 been tested as the action, because that needs a click.
+
+---
+
+## 17. The pause menu is a different subsystem
+
+Read live from a running game with the pause menu open, 2026-08-24.
+
+Everything in sections 12-16 is about the **frontend** — the main menu and its screens. None
+of it transfers to the in-game pause menu, and the first useful fact is how sharply the two
+are separated:
+
+| | frontend | pause menu |
+| --- | --- | --- |
+| definitions loaded | ~760 | 159 |
+| `CFrontEndScreen` (10) | 23 | **0** |
+| `CFrontEndButton` (11) | 15 | **0** |
+| `CFrontEndList` (12) | 9 | **0** |
+| id range | 100-700 | 5800-7000 |
+| component types | 0,1,2,5,6,10,11,12,15,16,18,22,38 | 0,1,2,5,6,**7,8**,13,32,34,38,40,41,42 |
+
+The frontend's definitions are not merely unused in-game, they are **not loaded at all**. So
+`mods/frontend`'s id table is inert once a game is running, and a pause-menu entry cannot be
+made by the same means.
+
+### What the pause menu is made of
+
+It is a tab strip, not a row list. A type 8 holds the tabs; each tab is a type 7 carrying a
+label and a content container:
+
+```
+type 8  5964      the tab strip
+  type 7  5947    [7004 6293 6354 6355 6356]           Save
+  type 7  5948                                          Load
+  type 7  5949    [7004 6295 6358 6365 6372 6187]      Gameplay Options
+  type 7  5950    [7004 6297 6359 6366 6373 6189]      Audio Options
+  type 7  5951    [7004 6299 6360 6367 6374 6191]      Video Options
+  type 7  5952    [7004 6301 6361 6368 6375 6192]      Redefine Keys
+  type 7  5963    action 315                            Quit
+```
+
+Each tab's children follow one shape: a shared element (7004), two per-tab elements, the
+**tab label** (`TEXT_GUI_MENUGUIDE_PAUSEMENU_*`), a **heading** (`TEXT_GUI_MENU_*`), and the
+tab's **content container** (type 8, 5-12 children).
+
+| tab | label CText | key | content |
+| --- | --- | --- | --- |
+| 5947 | 6355 | `..._PAUSEMENU_SAVE_WORLD` | — |
+| 5949 | 6365 | `..._PAUSEMENU_GAMEPLAY_OPTIONS` | 6187 (12) |
+| 5950 | 6366 | `..._PAUSEMENU_AUDIOOPTIONS` | 6189 (5) |
+| 5951 | 6367 | `..._PAUSEMENU_VIDEO_OPTIONS` | 6191 (12) |
+| 5952 | 6368 | `..._PAUSEMENU_REDEFINE_KEYS` | 6192 (5) |
+
+### What this means for a mod entry here
+
+The *structural* half looks reachable by the mechanisms already proved: these are CUIDefs
+with the same layout, they pass the same factory at `0x0041D249`, their labels are wide text
+keys at `+0x54`, and their children are id vectors at `+0x70`. Appending a tab and
+relabelling it should work exactly as appending a menu row did.
+
+The *behavioural* half does not transfer, and this is the blocker. In the frontend, a press
+is observable because each row opens a distinct **screen** and screen construction is the
+event (section 16 plus the callback in the mod loader's SDK). In the pause menu there are no
+screens: switching tabs builds nothing new, and only one tab (5963, Quit) carries an action
+at `+0xC4` at all. So there is currently no known way to notice that a pause-menu entry was
+activated.
+
+Finding that is its own RE pass, of about the size sections 12-16 were. The next step is the
+one that has worked every time: put an INT3 on the factory, get the pause menu open, and
+watch what is constructed when a tab is switched and when a control inside a tab is used --
+if anything is, that is the event; if nothing is, the click path has to be found in code
+rather than in data.
