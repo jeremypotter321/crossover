@@ -17,8 +17,16 @@
  * as long as "Mods", so the replacement is in place, needs no allocation, and
  * cannot overrun the buffer it sits in.
  *
- * Done before the frontend is built, so the first menu drawn is already the
- * answer rather than something that needs a rebuild to show.
+ * Done before the frontend is built, because there is no hot reload: the text
+ * is baked into the component at construction, so an edit that lands after the
+ * menu exists cannot show until the screen is rebuilt.
+ *
+ * Restricted to MEM_PRIVATE. The first attempt at this rewrote every writable
+ * match in the address space and killed the game -- and the log says why: of
+ * the 15 sites, 14 were at 0x68AE.... inside a loaded module's own string
+ * table, and only one (0x0936....) was the game's heap copy. Repeatedly
+ * overwriting another module's constants during startup is what crashed it.
+ * Private committed memory is the game's own allocations and nothing else.
  */
 
 #include <windows.h>
@@ -52,8 +60,10 @@ static int readable(const MEMORY_BASIC_INFORMATION *mbi)
     DWORD p = mbi->Protect;
     if (mbi->State != MEM_COMMIT) return 0;
     if (p & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
-    /* Writable only -- the copy we want to edit is heap data, and skipping
-     * read-only pages keeps us off the executable's own constants. */
+    /* Private only. MEM_IMAGE and MEM_MAPPED are modules and mapped files --
+     * someone else's constants, which is exactly what the first version of
+     * this trampled. */
+    if (mbi->Type != MEM_PRIVATE) return 0;
     return (p & (PAGE_READWRITE | PAGE_WRITECOPY |
                  PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
@@ -135,14 +145,16 @@ static DWORD WINAPI worker(LPVOID unused)
         int wrote;
         find_all();
         wrote = apply();
-        if (wrote && !announced) {
+        if (wrote) {
             int i;
             plog("");
-            plog("=== rewritten: %d occurrence(s) ===", wrote);
+            plog("=== rewrote %d of %d private occurrence(s) at t=%d ===",
+                 wrote, g_nhits, t);
             for (i = 0; i < g_nhits && i < 12; i++)
                 plog("    0x%08lX", g_hits[i]);
             announced = 1;
         }
+        (void)announced;
         /* Keep dismissing regardless of whether a write has landed: the
          * first matches come from a system module's own string table, so
          * `announced` goes true long before the game reaches its menu, and

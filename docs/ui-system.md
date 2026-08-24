@@ -700,3 +700,45 @@ answer:
 The clean route is the key, not the resolved text: point a row's `CText +0x54` at a
 `CharString` of our own before construction, and hook the key lookup so our key resolves
 to our label. That keeps the change to one row and needs no memory-wide rewriting.
+
+---
+
+## 15. CONFIRMED — a row's label is chosen at construction
+
+Seen on screen 2026-08-24 by `tools/re-probe/menu-swap.c`: the main menu's Quit row was
+drawn with **Options'** text, because one id in one child vector was changed before the
+component existed.
+
+```
+definition 252 (the CChangingStateComponent under Quit)
+   children  [254, 73]  ->  [269, 73]
+                 |               `- 269 is the CText Options' row uses
+                 `- 254 is the CText Quit's row uses
+```
+
+Applied in the factory window at `0x0041D249`, the same one-instruction window that adds a
+row. So the two halves of "put our own entry in the real menu" are now both proved:
+**which rows exist** (section 13) and **what a row says** (this).
+
+### Why the label had to be changed this way
+
+There is no hot reload. A CText's string is baked into the component at construction, so a
+definition edit made after the menu exists shows nothing until the screen is rebuilt — that
+is why `+0x54` looked inert when edited from an attached probe.
+
+Editing the *resolved* text instead does not work in that window either, and the reason is
+worth recording: **the localised strings do not exist yet.** A probe scanning private
+memory from process start never finds the wide `Quit` at all until the frontend loads,
+which is the moment we are trying to get in front of. Definitions are loaded long before,
+so the definition graph is the only thing available early enough to edit.
+
+(And when that same resolved-text rewrite is done across *all* writable memory rather than
+private memory only, it kills the game: 14 of its 15 matches were inside a loaded module's
+own string table, not the game's text bank. Filter on `MEMORY_BASIC_INFORMATION.Type ==
+MEM_PRIVATE`.)
+
+### What remains for a label of our own
+
+Swapping to another stock CText gives another stock label. An arbitrary one needs the key
+at `CText +0x54` to resolve to text we choose — either by hooking the key lookup, or by
+learning what the game does with a key that is not in the bank.
